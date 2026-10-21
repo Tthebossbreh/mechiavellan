@@ -4,9 +4,26 @@
 // because customization is the point of the game and real buttons, focus rings
 // and scrolling text are far better than hand-rolled canvas hit-testing.
 
-import { FRAMES, WEAPONS, makeLoadout, fireRate, burstDamage } from './weapons.js';
+import {
+  FRAMES,
+  WEAPONS,
+  makeLoadout,
+  fireRate,
+  burstDamage,
+  weaponRange,
+  totalHeatRate,
+  burstDps,
+  sustainedDps,
+  settleCycle,
+  willOverheat,
+} from './weapons.js';
 
 const DEFAULT_WEAPON_IDS = ['vulcan', 'autocannon', 'pulse', 'missiles', 'scatter', 'railgun'];
+
+/** Power draw can be fractional; show "14" rather than "14.0". */
+function fmt(value) {
+  return Number.isInteger(value) ? String(value) : value.toFixed(1);
+}
 
 export class Hangar {
   /**
@@ -131,11 +148,13 @@ export class Hangar {
         <span class="card__tag">${frame.slots} hardpoints</span>
         <h3 class="card__title">${frame.name}</h3>
         <p class="card__code">${frame.codename}</p>
-        <dl class="stats">
+        <dl class="stats stats--three">
           <div><dt>Hull</dt><dd>${frame.hull}</dd></div>
           <div><dt>Speed</dt><dd>${frame.speed}</dd></div>
           <div><dt>Jump</dt><dd>${frame.jump}</dd></div>
           <div><dt>Armor</dt><dd>${frame.armor}</dd></div>
+          <div><dt>Heat sink</dt><dd>${frame.capacity}</dd></div>
+          <div><dt>Agility</dt><dd>${frame.accel}</dd></div>
         </dl>
         <p class="card__blurb">${frame.blurb}</p>`;
       card.addEventListener('click', () => this._selectFrame(frame));
@@ -153,11 +172,11 @@ export class Hangar {
       card.innerHTML = `
         <span class="card__tag">${weapon.klass}</span>
         <h3 class="card__title">${weapon.name}</h3>
-        <p class="card__code">${weapon.abbr}</p>
+        <p class="card__code">${weapon.abbr} · ${Math.round(weaponRange(weapon))} px range</p>
         <dl class="stats stats--compact">
           <div><dt>Dmg</dt><dd>${burstDamage(weapon)}</dd></div>
           <div><dt>Rate</dt><dd>${fireRate(weapon).toFixed(1)}/s</dd></div>
-          <div><dt>Mass</dt><dd>${weapon.weight}</dd></div>
+          <div><dt>Heat</dt><dd>${weapon.heat}/s</dd></div>
         </dl>
         <p class="card__blurb">${weapon.blurb}</p>`;
       card.addEventListener('click', () => this._selectWeapon(weapon));
@@ -201,9 +220,26 @@ export class Hangar {
     this._renderSlots();
 
     const f = this.frame;
-    this.els.stats.textContent =
-      `${f.name} · ${f.slots} hardpoints available · hull ${f.hull} · speed ${f.speed} · ` +
-      `jump ${f.jump} · armor ${f.armor}`;
+    const weapons = this.slots.map((id) => WEAPONS.find((w) => w.id === id) || null);
+    const heat = totalHeatRate(weapons);
+    const burst = burstDps(weapons);
+    const sustain = sustainedDps(f, weapons);
+
+    let heatText;
+    if (heat <= f.cooling) {
+      heatText = 'runs cool — full rate, forever';
+    } else if (willOverheat(f, weapons)) {
+      heatText = 'saturates: expect a vent cycle';
+    } else {
+      heatText = `settles at ×${settleCycle(f, weapons).toFixed(2)} cooldown`;
+    }
+
+    this.els.stats.innerHTML =
+      `${f.name} · ${f.slots} hardpoints · hull ${f.hull} · speed ${f.speed} · ` +
+      `jump ${f.jump} · armor ${f.armor}<br>` +
+      `<strong>HEAT ${fmt(heat)}/s vs cooling ${f.cooling}/s</strong> · ${heatText}<br>` +
+      `burst <strong>${Math.round(burst)} dps</strong> · sustained ` +
+      `<strong>${Math.round(sustain)} dps</strong>`;
 
     const armed = this.slots.filter(Boolean).length;
     const empty = f.slots - armed;

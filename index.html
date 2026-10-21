@@ -12,7 +12,7 @@
   </head>
   <body>
     <canvas id="game"></canvas>
-    <p id="hint">A / D move &middot; SPACE jump &middot; MOUSE aim &middot; CLICK or J fire &middot; H hangar</p>
+    <p id="hint">A / D move &middot; SPACE jump &middot; MOUSE aim &middot; CLICK or J fire all &middot; 1-6 fire one hardpoint &middot; H hangar</p>
 
     <div id="hangar" class="hangar">
       <header class="hangar__head">
@@ -35,7 +35,11 @@
           <p class="stat-line" id="frame-stats"></p>
           <p class="help">
             Pick a weapon from the armory, then click a hardpoint to install it.
-            Click a filled hardpoint to clear it.
+            Click a filled hardpoint to clear it. Firing builds heat and heat
+            throttles your rate of fire, so every chassis lands at roughly the
+            same <em>sustained</em> damage &mdash; more hardpoints buys a bigger
+            opening volley instead. In combat, hold a number key to fire one
+            hardpoint on its own and stay cool.
           </p>
         </section>
 

@@ -8,9 +8,9 @@
 // and how they fire — comes from the hangar rather than from this file.
 
 import { clamp, rand } from './utils.js';
+import { cycleScaleAt, heatPerShot } from './weapons.js';
 
 const GRAVITY = 2400;
-const MOVE_ACCEL = 5200;
 const GROUND_FRICTION = 4200;
 const AIR_FRICTION = 400;
 
@@ -166,6 +166,16 @@ export class Player {
     this.armor = this.frame.armor;
     this.moveSpeed = this.frame.speed;
     this.jumpVelocity = this.frame.jump;
+    this.accel = this.frame.accel;
+    this.mass = this.frame.mass;
+
+    // Heat: firing adds heat, cooling removes it, and the current heat level
+    // throttles every weapon's rate of fire. This is what turns a six-hardpoint
+    // frame into a burst machine instead of simply triple damage.
+    this.heat = 0;
+    this.heatRatio = 0;
+    this.overheated = false;
+    this.cycleScale = 1;
 
     this.cooldowns = this.weaponDefs.map(() => 0);
     this.walkPhase = 0;
@@ -196,7 +206,7 @@ export class Player {
     const dir = (right ? 1 : 0) - (left ? 1 : 0);
 
     if (dir !== 0) {
-      this.vx += dir * MOVE_ACCEL * dt;
+      this.vx += dir * this.accel * dt;
     } else {
       const friction = (this.onGround ? GROUND_FRICTION : AIR_FRICTION) * dt;
       if (Math.abs(this.vx) <= friction) this.vx = 0;
@@ -243,18 +253,36 @@ export class Player {
       this.walkPhase += dt * (6 + Math.abs(this.vx) * 0.03);
     }
 
+    // --- heat: shed heat, then derive this frame's throttle from what is left.
+    // Venting is not faster than normal cooling; overheating simply means you
+    // stop shooting while the sink drains, which is the real cost of an alpha
+    // strike. Boosting vent rate here would let a six-gun frame out-damage the
+    // others over a full fire cycle.
+    this.heat = Math.max(0, this.heat - this.frame.cooling * dt);
+    if (this.overheated && this.heat <= this.frame.capacity * 0.35) {
+      this.overheated = false;
+    }
+    this.heatRatio = clamp(this.heat / this.frame.capacity, 0, 1);
+    this.cycleScale = cycleScaleAt(this.frame, this.heat);
+
     // --- weapons: every hardpoint runs its own cooldown
     for (let i = 0; i < this.cooldowns.length; i++) {
       this.cooldowns[i] = Math.max(0, this.cooldowns[i] - dt);
     }
 
-    const firing = input.mouse.down || input.isDown('KeyJ');
-    if (firing) {
+    // Mouse / J fires every ready hardpoint. Holding a number key (1..6) fires
+    // only that hardpoint — which is how you manage heat: nibble with a couple
+    // of guns to stay cool, or dump the whole rack for an alpha strike.
+    if (!this.overheated) {
+      const fireAll = input.mouse.down || input.isDown('KeyJ');
       let fired = false;
       for (let i = 0; i < this.weaponDefs.length; i++) {
-        const weapon = this.weaponDefs[i];
         if (this.cooldowns[i] > 0) continue;
-        this.cooldowns[i] = weapon.cooldown;
+        if (!fireAll && !input.isDown(`Digit${i + 1}`)) continue;
+
+        const weapon = this.weaponDefs[i];
+        this.cooldowns[i] = weapon.cooldown * this.cycleScale;
+        this.heat += heatPerShot(weapon);
         this._fireWeapon(i, weapon, ctx);
         fired = true;
       }
@@ -262,6 +290,12 @@ export class Player {
         this.recoil = 1;
         this.muzzleFlash = 0.06;
         audio.shoot();
+      }
+      if (this.heat >= this.frame.capacity) {
+        this.heat = this.frame.capacity;
+        this.overheated = true;
+        particles.spawnDust(this.cx, this.y + this.h * 0.45, 14);
+        audio.hurt();
       }
     }
 
@@ -303,8 +337,8 @@ export class Player {
       );
     }
 
-    // Heavier weapons shove the mech around more.
-    this.vx -= Math.cos(angle) * (weapon.weight || 3) * 2.2;
+    // Heavier weapons shove the mech around more; heavy frames shrug it off.
+    this.vx -= (Math.cos(angle) * (weapon.weight || 3) * 2.2) / this.mass;
     particles.spawnMuzzle(ox, oy, angle);
   }
 

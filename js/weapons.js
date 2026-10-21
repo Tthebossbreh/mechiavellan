@@ -1,10 +1,57 @@
 // Mech parts data. Customization is the core pillar of the game, so this file
 // is deliberately data-only: everything here is pure and unit-testable, and is
 // read both by the hangar UI and the simulation.
+//
+// ---------------------------------------------------------------------------
+// HEAT MODEL  (this is what keeps the frames honest)
+// ---------------------------------------------------------------------------
+// Every weapon has a `heat` (heat generated per second at its nominal rate).
+// Every chassis has a `cooling` (heat shed per second) and a `capacity` (heat
+// sink size). Firing adds heat, cooling removes it, and the *current* heat
+// level throttles every weapon's rate of fire:
+//
+//     heatRatio = heat / capacity
+//     cycleScale = 1 + heatRatio * HEAT_THROTTLE      (> 1 = slower cycling)
+//     effectiveCooldown = weapon.cooldown * cycleScale
+//
+// At a steady state, heat generated == heat shed, which means:
+//
+//     sustained dps ~= cooling * (sum of dps) / (sum of heat)
+//
+// Note what is *missing* from that equation: the number of hardpoints. Because
+// cooling is the same on every chassis, and because each weapon's `heat` is set
+// to roughly its damage-per-second / 10, sustained damage ends up near-identical
+// whichever frame you pick. What the frame changes is **burst**:
+//
+//   * Light frame: two guns, low heat, so it never really overheats. It just
+//     keeps firing, all day, forever.
+//   * Large frame: six guns -> triple the alpha strike, but the reactor
+//     saturates in a few seconds and you must let it vent.
+//
+// So six guns is no longer "three times the damage for a bit less speed". It is
+// three times the *burst*, paid for with speed, size, and a vent cycle.
+//
+// Filling every hardpoint is always better than leaving one empty (more guns =
+// more burst, same sustained), so there is no reason to under-fill.
+
+import { clamp } from './utils.js';
 
 /**
- * Chassis. The frame decides how many weapons you can carry, how fast the
- * machine moves, how much hull it has and how much damage it shrugs off.
+ * How much heat throttles rate of fire: cycleScale at 100% heat is 1 + this.
+ *
+ * Kept low deliberately. A loadout settles where heat generated == heat shed,
+ * i.e. cycleScale ~= heatRate / cooling. If that target is above 1 + throttle
+ * the mech cannot settle and will saturate and overheat instead -- which is
+ * exactly the large frame's identity, and the light frame can never reach it.
+ */
+export const HEAT_THROTTLE = 1.6;
+
+/** Radiator throughput is identical on every chassis. */
+export const COOLING = 14;
+
+/**
+ * Chassis. The frame decides how big a heat sink you have (i.e. how long an
+ * alpha strike you can sustain) and how well you can avoid being hit.
  * @typedef {object} Frame
  * @property {string} id
  * @property {string} name
@@ -12,8 +59,12 @@
  * @property {number} hull      max health
  * @property {number} speed     max horizontal speed (px/s)
  * @property {number} jump      jump impulse (px/s)
+ * @property {number} accel     horizontal acceleration (px/s^2)
  * @property {number} armor     flat damage reduction
+ * @property {number} mass      recoil resistance (heavier frames kick less)
  * @property {number} slots     how many weapons this frame can carry
+ * @property {number} cooling   heat shed per second
+ * @property {number} capacity  heat sink size
  * @property {number} scale     visual + hitbox scale
  * @property {string} blurb
  */
@@ -24,44 +75,65 @@ export const FRAMES = [
     id: 'light',
     name: 'Light Frame',
     codename: 'WRAITH-2',
-    hull: 80,
+    hull: 100,
     speed: 470,
     jump: 910,
+    accel: 6600,
     armor: 0,
+    mass: 1,
     slots: 2,
+    cooling: COOLING,
+    capacity: 55,
     scale: 0.88,
-    blurb: 'Fastest chassis on the field. Paper plating, and only two hardpoints to work with.',
+    blurb:
+      'Fastest chassis and the smallest target. It runs cool, so its two guns keep cycling while bigger machines are venting.',
   },
   {
     id: 'medium',
     name: 'Medium Frame',
     codename: 'BASTION-4',
-    hull: 120,
+    hull: 135,
     speed: 385,
     jump: 830,
+    accel: 5200,
     armor: 1,
+    mass: 1.6,
     slots: 4,
+    cooling: COOLING,
+    capacity: 85,
     scale: 1,
-    blurb: 'The workhorse. Balanced armor, speed and four hardpoints to fill.',
+    blurb:
+      'The all-rounder. Four hardpoints: double the alpha strike of a light frame, with enough heat sink to hold it for a few seconds.',
   },
   {
     id: 'large',
     name: 'Large Frame',
     codename: 'LEVIATHAN-6',
-    hull: 180,
-    speed: 300,
-    jump: 745,
+    hull: 165,
+    speed: 290,
+    jump: 700,
+    accel: 4000,
     armor: 2,
+    mass: 2.4,
     slots: 6,
-    scale: 1.18,
-    blurb: 'A walking fortress. Heavy, slow, and it carries a full six hardpoints.',
+    cooling: COOLING,
+    capacity: 115,
+    scale: 1.2,
+    blurb:
+      'A walking fortress. Six hardpoints means a monstrous opening volley — then the reactor saturates and you must vent, slowly, in a very large target.',
   },
 ];
 
 /**
  * Weapons. `cooldown` is seconds between shots, `speed` is projectile speed in
- * px/s and `life` is the projectile's lifetime in seconds (which is what gives
- * each weapon its effective range).
+ * px/s and `life` is the projectile's lifetime in seconds, so speed * life is
+ * the weapon's effective range.
+ *
+ * `heat` is heat generated per second at the nominal rate, and is deliberately
+ * close to damage-per-second / 10 so that no weapon is a strictly better use of
+ * your heat budget than another. The outliers are nudged for range and for
+ * whether the shots are guaranteed to connect.
+ *
  * @typedef {object} Weapon
  * @property {string} id
  * @property {string} name
@@ -78,7 +150,8 @@ export const FRAMES = [
  * @property {string} color
  * @property {number} pierce   extra enemies a projectile can pass through
  * @property {number} homing   turn rate in rad/s (0 = unguided)
- * @property {number} weight   used for recoil and as flavour
+ * @property {number} weight   recoil mass and flavour
+ * @property {number} heat     heat per second at nominal rate
  * @property {string} blurb
  */
 
@@ -101,6 +174,7 @@ export const WEAPONS = [
     pierce: 0,
     homing: 0,
     weight: 3,
+    heat: 6.7,
     blurb: 'Shredder. Trades punch for a constant wall of lead.',
   },
   {
@@ -120,7 +194,8 @@ export const WEAPONS = [
     pierce: 0,
     homing: 0,
     weight: 5,
-    blurb: 'Dependable mid-calibre rounds. Nothing fancy, nothing wasted.',
+    heat: 5,
+    blurb: 'Dependable mid-calibre rounds. Runs cool for its damage.',
   },
   {
     id: 'pulse',
@@ -139,6 +214,7 @@ export const WEAPONS = [
     pierce: 0,
     homing: 0,
     weight: 4,
+    heat: 6.9,
     blurb: 'Accurate, flat-trajectory bolts. Best when you can hold the line.',
   },
   {
@@ -147,7 +223,7 @@ export const WEAPONS = [
     abbr: 'PLZ',
     klass: 'Energy',
     kind: 'energy',
-    damage: 34,
+    damage: 38,
     cooldown: 0.9,
     speed: 620,
     life: 1.6,
@@ -158,7 +234,8 @@ export const WEAPONS = [
     pierce: 0,
     homing: 0,
     weight: 9,
-    blurb: 'Slow, fat, punishing. Land it and most things notice.',
+    heat: 4.4,
+    blurb: 'Cheap on heat, slow to arrive, and it hits like a truck. Lead your targets.',
   },
   {
     id: 'scatter',
@@ -169,7 +246,7 @@ export const WEAPONS = [
     damage: 7,
     cooldown: 0.75,
     speed: 880,
-    life: 0.42,
+    life: 0.5,
     pellets: 5,
     spread: 0.22,
     size: { w: 7, h: 7 },
@@ -177,7 +254,8 @@ export const WEAPONS = [
     pierce: 0,
     homing: 0,
     weight: 6,
-    blurb: 'Five pellets, brutal up close, near-useless at range.',
+    heat: 4.9,
+    blurb: 'Five pellets, brutal up close, near-useless at range. Runs cool.',
   },
   {
     id: 'missiles',
@@ -196,7 +274,8 @@ export const WEAPONS = [
     pierce: 0,
     homing: 2.6,
     weight: 7,
-    blurb: 'Guided warheads. Fire them and get on with your day.',
+    heat: 7,
+    blurb: 'Guided warheads that always connect. You pay full heat for that.',
   },
   {
     id: 'railgun',
@@ -215,7 +294,8 @@ export const WEAPONS = [
     pierce: 3,
     homing: 0,
     weight: 10,
-    blurb: 'Hypervelocity slug that punches clean through a line of enemies.',
+    heat: 4.5,
+    blurb: 'Hypervelocity slug that punches through a line of enemies. Line them up.',
   },
   {
     id: 'flamer',
@@ -225,16 +305,17 @@ export const WEAPONS = [
     kind: 'energy',
     damage: 3,
     cooldown: 0.045,
-    speed: 430,
-    life: 0.28,
+    speed: 520,
+    life: 0.45,
     pellets: 1,
-    spread: 0.3,
+    spread: 0.22,
     size: { w: 11, h: 11 },
     color: '#ff7a3c',
     pierce: 0,
     homing: 0,
     weight: 4,
-    blurb: 'A cone of fire. Terrifying at contact range, dead weight beyond it.',
+    heat: 6.7,
+    blurb: 'A cone of fire with a surprising reach. Cheap on heat, hungry for contact range.',
   },
 ];
 
@@ -248,18 +329,33 @@ export function frameById(id) {
   return FRAMES.find((f) => f.id === id) || null;
 }
 
-/** Shots per second, for display. */
+/** Shots per second at nominal cooldown, for display. */
 export function fireRate(weapon) {
   return weapon.cooldown > 0 ? 1 / weapon.cooldown : 0;
 }
 
-/** Nominal sustained damage per second if every projectile connects. */
+/** Damage in one shot (all pellets). */
 export function burstDamage(weapon) {
   return weapon.damage * (weapon.pellets || 1);
 }
 
+/** Effective reach in px. */
+export function weaponRange(weapon) {
+  return weapon.speed * weapon.life;
+}
+
+/** Damage per second at nominal rate (no heat throttling). */
+export function weaponDps(weapon) {
+  return burstDamage(weapon) / weapon.cooldown;
+}
+
+/** Heat added by a single shot (heat rate x time between shots). */
+export function heatPerShot(weapon) {
+  return weapon.heat * weapon.cooldown;
+}
+
 /**
- * Build a loadout object. `weapons` is a list of weapon ids or nulls; empty
+ * Build a loadout object. `weaponIds` is a list of weapon ids or nulls; empty
  * slots are dropped so the simulation only ever sees installed weapons.
  * @param {string} frameId
  * @param {(string|null)[]} weaponIds
@@ -274,8 +370,62 @@ export function makeLoadout(frameId, weaponIds) {
   return { frame, weapons };
 }
 
-/** Slots armed vs slots available. */
-export function loadoutSummary(frame, weaponIds) {
-  const armed = weaponIds.slice(0, frame.slots).filter(Boolean).length;
-  return { armed, slots: frame.slots };
+/** Total heat generated per second with every weapon firing. */
+export function totalHeatRate(weapons) {
+  let total = 0;
+  for (const w of weapons) if (w) total += w.heat || 0;
+  return total;
+}
+
+/** Total damage per second with every weapon at nominal rate (burst). */
+export function burstDps(weapons) {
+  let total = 0;
+  for (const w of weapons) if (w) total += weaponDps(w);
+  return total;
+}
+
+/**
+ * Sustained damage per second once heat generation balances heat shedding.
+ * Independent of hardpoint count, which is what keeps the frames level.
+ * @param {object} frame
+ * @param {(object|null)[]} weapons
+ */
+export function sustainedDps(frame, weapons) {
+  const burst = burstDps(weapons);
+  if (burst <= 0) return 0;
+  const heat = totalHeatRate(weapons);
+  if (heat <= frame.cooling) return burst; // never throttles: full rate, forever
+  return burst * (frame.cooling / heat);
+}
+
+/**
+ * The cooldown multiplier a loadout settles at under sustained fire. 1 means it
+ * runs cool and never throttles.
+ * @param {object} frame
+ * @param {(object|null)[]} weapons
+ */
+export function settleCycle(frame, weapons) {
+  const heat = totalHeatRate(weapons);
+  if (heat <= frame.cooling) return 1;
+  return heat / frame.cooling;
+}
+
+/**
+ * True when sustained fire cannot settle below the throttle ceiling, so the
+ * mech will saturate its heat sink and be forced to vent.
+ * @param {object} frame
+ * @param {(object|null)[]} weapons
+ */
+export function willOverheat(frame, weapons) {
+  return settleCycle(frame, weapons) > 1 + HEAT_THROTTLE;
+}
+
+/**
+ * Cooldown multiplier at a given heat level. Exposed so the hangar and the
+ * simulation agree on exactly one definition.
+ * @param {object} frame
+ * @param {number} heat
+ */
+export function cycleScaleAt(frame, heat) {
+  return 1 + clamp(heat / frame.capacity, 0, 1) * HEAT_THROTTLE;
 }

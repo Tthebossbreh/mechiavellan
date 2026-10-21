@@ -13,6 +13,12 @@ import { clamp, rand, aabb } from './utils.js';
 
 const BEST_KEY = 'mechiavellan.best';
 
+/** Distance the mech must cover to reach the extraction beacon. */
+const OBJECTIVE_METERS = 1500;
+const OBJECTIVE_DISTANCE = OBJECTIVE_METERS * 10;
+/** A garrison is waiting at the pad, spawned this far out. */
+const GARRISON_TRIGGER = OBJECTIVE_DISTANCE - 2400;
+
 /** localStorage can throw (private mode, sandboxed iframes); never let it crash. */
 function loadBest() {
   try {
@@ -127,6 +133,7 @@ export class Game {
     this.kills = 0;
     this.distance = 0;
     this.shake = 0;
+    this.garrisonSpawned = false;
   }
 
   // --- Update ---------------------------------------------------------------
@@ -140,7 +147,7 @@ export class Game {
       return;
     }
 
-    if (this.state === 'gameover') {
+    if (this.state === 'gameover' || this.state === 'victory') {
       this.particles.update(dt);
       if (this.input.anyPressed('Enter', 'NumpadEnter', 'Space')) {
         this.deploy(this.loadout);
@@ -178,11 +185,18 @@ export class Game {
     const targetX = this.player.x - this.view.w * 0.35;
     this.camera.x += (targetX - this.camera.x) * Math.min(1, dt * 5);
 
-    const difficulty = clamp(this.distance / 5000, 0, 1);
+    const difficulty = clamp(this.distance / (OBJECTIVE_DISTANCE * 0.8), 0, 1);
     this.spawnTimer -= dt;
     if (this.spawnTimer <= 0 && this.enemies.length < 16) {
       this.spawnEnemy();
       this.spawnTimer = rand(1.3, 2.2) * (1 - difficulty * 0.5);
+    }
+
+    // The extraction pad is guarded, so arriving is a fight rather than a
+    // formality (and sprinting the whole course has a price).
+    if (!this.garrisonSpawned && this.distance > GARRISON_TRIGGER) {
+      this.garrisonSpawned = true;
+      for (let i = 0; i < 5; i++) this.spawnEnemy(true);
     }
 
     this.handleCollisions();
@@ -197,6 +211,18 @@ export class Game {
     this.score = this.kills * 100 + Math.floor(this.distance / 12);
     this.shake = Math.max(0, this.shake - dt * 40);
 
+    if (this.state === 'playing' && this.distance >= OBJECTIVE_DISTANCE) {
+      this.state = 'victory';
+      this.score += 1000; // extraction bonus
+      if (this.score > this.best) {
+        this.best = this.score;
+        saveBest(this.best);
+      }
+      this.particles.spawnExplosion(this.player.cx, this.player.cy - 20, 40, '#7fe6ff');
+      this.audio.tone({ freq: 520, type: 'triangle', duration: 0.5, gain: 0.06, sweep: 320 });
+      this.shake = 10;
+    }
+
     if (this.player.dead && this.state === 'playing') {
       this.state = 'gameover';
       if (this.score > this.best) {
@@ -209,15 +235,23 @@ export class Game {
     }
   }
 
-  spawnEnemy() {
-    const x = this.camera.x + this.view.w + rand(80, 260);
-    const roll = Math.random();
+  /**
+   * Enemies arrive from both sides now, so you cannot simply back away from
+   * trouble — but you also cannot be flanked by a static gun.
+   * @param {boolean} forceAhead garrison wave: always in front of the player
+   */
+  spawnEnemy(forceAhead = false) {
+    const fromBehind = !forceAhead && Math.random() < 0.35;
+    const x = fromBehind
+      ? Math.max(20, this.camera.x - rand(50, 190))
+      : this.camera.x + this.view.w + rand(80, 260);
 
+    const roll = Math.random();
     let enemy;
     if (roll < 0.5) {
-      const y = this.world.groundBase - rand(120, 280);
-      enemy = new Drone(x, y);
-    } else if (roll < 0.82) {
+      enemy = new Drone(x, this.world.groundBase - rand(120, 280));
+    } else if (roll < 0.82 || fromBehind) {
+      // Nothing static behind you: a turret back there would just get culled.
       enemy = new Wrecker(x, 0);
     } else {
       enemy = new Turret(x, 0);
@@ -297,8 +331,11 @@ export class Game {
       }
     }
 
+    // With enemies on both sides, only cull things that are genuinely gone.
+    const behindLimit = this.camera.x - this.view.w * 1.1;
+    const aheadLimit = this.camera.x + this.view.w * 2;
     for (const enemy of this.enemies) {
-      if (enemy.x + enemy.w < this.camera.x - 260) enemy.dead = true;
+      if (enemy.x + enemy.w < behindLimit || enemy.x > aheadLimit) enemy.dead = true;
     }
   }
 
@@ -321,6 +358,7 @@ export class Game {
     if (this.state !== 'hangar') {
       ctx.save();
       ctx.translate(-Math.round(this.camera.x), 0);
+      this.drawBeacon(ctx);
       this.particles.draw(ctx);
       for (const enemy of this.enemies) enemy.draw(ctx);
       if (this.player && !this.player.dead) this.player.draw(ctx);
@@ -338,15 +376,14 @@ export class Game {
     ctx.fillStyle = vg;
     ctx.fillRect(0, 0, w, h);
 
-    if (this.state === 'playing') {
+    if (this.state === 'playing' || this.state === 'victory' || this.state === 'gameover') {
       this.drawHUD(ctx);
       this.drawWeaponRack(ctx);
-      this.drawCrosshair(ctx);
-    } else if (this.state === 'gameover') {
-      this.drawHUD(ctx);
-      this.drawWeaponRack(ctx);
-      this.drawGameOver(ctx);
+      this.drawObjective(ctx);
     }
+    if (this.state === 'playing') this.drawCrosshair(ctx);
+    if (this.state === 'gameover') this.drawGameOver(ctx);
+    if (this.state === 'victory') this.drawVictory(ctx);
   }
 
   drawHUD(ctx) {
@@ -377,6 +414,29 @@ export class Game {
     ctx.fillStyle = '#9fb3d1';
     ctx.fillText(`HULL · ${this.player.frame.name.toUpperCase()}`, x, y + barH + 15);
 
+    // Heat sink: how close the mech is to saturating and being forced to vent.
+    const heatY = y + barH + 30;
+    ctx.fillStyle = 'rgba(8, 12, 22, 0.7)';
+    ctx.fillRect(x - 4, heatY - 4, barW + 8, 20);
+    ctx.fillStyle = '#2a3346';
+    ctx.fillRect(x, heatY, barW, 12);
+
+    const heat = this.player.heatRatio;
+    const heatGrad = ctx.createLinearGradient(x, 0, x + barW, 0);
+    heatGrad.addColorStop(0, '#8fe9ff');
+    heatGrad.addColorStop(0.6, '#ffd257');
+    heatGrad.addColorStop(1, '#ff5d5d');
+    ctx.fillStyle = heatGrad;
+    ctx.fillRect(x, heatY, barW * heat, 12);
+    ctx.strokeStyle = this.player.overheated
+      ? 'rgba(255, 90, 90, 0.9)'
+      : 'rgba(120, 180, 220, 0.5)';
+    ctx.strokeRect(x + 0.5, heatY + 0.5, barW, 12);
+
+    ctx.font = '600 11px ui-monospace, SFMono-Regular, Menlo, monospace';
+    ctx.fillStyle = this.player.overheated ? '#ff7a6b' : '#9fb3d1';
+    ctx.fillText(this.player.overheated ? 'HEAT · VENTING' : 'HEAT', x, heatY + 12 + 12);
+
     ctx.textAlign = 'right';
     ctx.fillStyle = '#dfeaff';
     ctx.font = '700 22px ui-monospace, SFMono-Regular, Menlo, monospace';
@@ -405,6 +465,21 @@ export class Game {
     ctx.textBaseline = 'middle';
     ctx.textAlign = 'left';
 
+    // Reactor status: heat state is what the player needs to read mid-fight.
+    const status = this.player.overheated
+      ? { text: 'OVERHEAT — VENTING', color: '#ff7a6b' }
+      : this.player.cycleScale > 1.05
+        ? { text: `HEAT THROTTLE ×${this.player.cycleScale.toFixed(2)}`, color: '#ffd257' }
+        : null;
+
+    if (status) {
+      ctx.textAlign = 'center';
+      ctx.font = '700 12px ui-monospace, SFMono-Regular, Menlo, monospace';
+      ctx.fillStyle = status.color;
+      ctx.fillText(status.text, w / 2, y - 10);
+      ctx.textAlign = 'left';
+    }
+
     for (let i = 0; i < weapons.length; i++) {
       const weapon = weapons[i];
       const cooldown = this.player.cooldowns[i];
@@ -423,6 +498,13 @@ export class Game {
       ctx.font = '600 9px ui-monospace, SFMono-Regular, Menlo, monospace';
       ctx.fillStyle = '#7f93b8';
       ctx.fillText(weapon.klass.toUpperCase(), x + 8, y + 24);
+
+      // Hotkey: hold this number to fire only this hardpoint.
+      ctx.textAlign = 'right';
+      ctx.font = '700 10px ui-monospace, SFMono-Regular, Menlo, monospace';
+      ctx.fillStyle = '#8fa6c9';
+      ctx.fillText(String(i + 1), x + boxW - 8, y + 12);
+      ctx.textAlign = 'left';
 
       ctx.fillStyle = 'rgba(127, 230, 255, 0.85)';
       ctx.fillRect(x + 8, y + boxH - 6, (boxW - 16) * ready, 2);
@@ -451,6 +533,130 @@ export class Game {
     ctx.stroke();
     ctx.fillStyle = 'rgba(127, 230, 255, 0.9)';
     ctx.fillRect(x - 1.5, y - 1.5, 3, 3);
+    ctx.restore();
+  }
+
+  /** The extraction pad, drawn in world space so it scrolls into view. */
+  drawBeacon(ctx) {
+    const x = 180 + OBJECTIVE_DISTANCE;
+    const groundY = this.world.groundY(x);
+    const pulse = (this.time * 0.7) % 1;
+
+    ctx.save();
+
+    const beam = ctx.createLinearGradient(0, groundY - 700, 0, groundY);
+    beam.addColorStop(0, 'rgba(127, 230, 255, 0)');
+    beam.addColorStop(1, 'rgba(127, 230, 255, 0.4)');
+    ctx.fillStyle = beam;
+    ctx.fillRect(x - 30, groundY - 700, 60, 700);
+
+    ctx.strokeStyle = 'rgba(127, 230, 255, 0.9)';
+    ctx.lineWidth = 3;
+    ctx.beginPath();
+    ctx.ellipse(x, groundY, 90, 18, 0, 0, Math.PI * 2);
+    ctx.stroke();
+
+    for (let i = 0; i < 2; i++) {
+      const p = (pulse + i * 0.5) % 1;
+      ctx.globalAlpha = 1 - p;
+      ctx.beginPath();
+      ctx.ellipse(x, groundY, 90 + p * 130, 18 + p * 26, 0, 0, Math.PI * 2);
+      ctx.stroke();
+    }
+    ctx.globalAlpha = 1;
+
+    ctx.fillStyle = '#7fe6ff';
+    ctx.shadowColor = '#4fd6ff';
+    ctx.shadowBlur = 24;
+    ctx.fillRect(x - 6, groundY - 90, 12, 90);
+    ctx.shadowBlur = 0;
+
+    ctx.restore();
+  }
+
+  /** Progress toward the extraction point. */
+  drawObjective(ctx) {
+    const { w } = this.view;
+    const progress = clamp(this.distance / OBJECTIVE_DISTANCE, 0, 1);
+    const barW = 200;
+    const barH = 7;
+    const x = (w - barW) / 2;
+    const y = 30;
+
+    const done = progress >= 1;
+
+    ctx.save();
+    ctx.textAlign = 'center';
+    ctx.textBaseline = 'middle';
+    ctx.font = '700 10px ui-monospace, SFMono-Regular, Menlo, monospace';
+    ctx.fillStyle = done ? '#7fe6ff' : '#8fa6c9';
+    ctx.fillText(
+      done ? 'EXTRACTION REACHED' : `EXTRACTION  ${Math.floor(this.distance / 10)} / ${OBJECTIVE_METERS} m`,
+      w / 2,
+      y - 10
+    );
+
+    ctx.fillStyle = 'rgba(8, 12, 22, 0.7)';
+    ctx.fillRect(x - 3, y - 3, barW + 6, barH + 6);
+    ctx.fillStyle = '#2a3346';
+    ctx.fillRect(x, y, barW, barH);
+
+    const grad = ctx.createLinearGradient(x, 0, x + barW, 0);
+    grad.addColorStop(0, '#3ee08a');
+    grad.addColorStop(1, '#7fe6ff');
+    ctx.fillStyle = grad;
+    ctx.fillRect(x, y, barW * progress, barH);
+    ctx.strokeStyle = 'rgba(120, 180, 220, 0.5)';
+    ctx.lineWidth = 1;
+    ctx.strokeRect(x + 0.5, y + 0.5, barW, barH);
+
+    ctx.restore();
+  }
+
+  drawVictory(ctx) {
+    const { w, h } = this.view;
+    ctx.save();
+    ctx.fillStyle = 'rgba(2, 14, 12, 0.6)';
+    ctx.fillRect(0, 0, w, h);
+
+    ctx.textAlign = 'center';
+    ctx.textBaseline = 'middle';
+    const cy = h / 2;
+
+    ctx.fillStyle = '#8ff0d0';
+    ctx.shadowColor = '#3ee08a';
+    ctx.shadowBlur = 26;
+    ctx.font = '800 46px ui-monospace, SFMono-Regular, Menlo, monospace';
+    ctx.fillText('EXTRACTION COMPLETE', w / 2, cy - 84);
+    ctx.shadowBlur = 0;
+
+    ctx.fillStyle = '#dfeaff';
+    ctx.font = '700 26px ui-monospace, SFMono-Regular, Menlo, monospace';
+    ctx.fillText(String(this.score).padStart(6, '0'), w / 2, cy - 26);
+
+    ctx.fillStyle = '#8fa6c9';
+    ctx.font = '600 14px ui-monospace, SFMono-Regular, Menlo, monospace';
+    ctx.fillText(
+      `${Math.floor(this.distance / 10)} m   ·   ${this.kills} kills   ·   best ${String(this.best).padStart(6, '0')}`,
+      w / 2,
+      cy + 8
+    );
+
+    ctx.fillStyle = '#9fb3d1';
+    ctx.font = '600 13px ui-monospace, SFMono-Regular, Menlo, monospace';
+    ctx.fillText(
+      `${this.player.frame.name.toUpperCase()} · ${this.player.weaponDefs.map((x) => x.abbr).join('  ') || 'UNARMED'}`,
+      w / 2,
+      cy + 40
+    );
+
+    const pulse = 0.6 + 0.4 * Math.sin(this.time * 3);
+    ctx.globalAlpha = pulse;
+    ctx.fillStyle = '#dfeaff';
+    ctx.font = '700 18px ui-monospace, SFMono-Regular, Menlo, monospace';
+    ctx.fillText('[ ENTER ]  REDEPLOY     [ H ]  HANGAR', w / 2, cy + 88);
+    ctx.globalAlpha = 1;
+
     ctx.restore();
   }
 
