@@ -8,10 +8,15 @@ import { Input } from './input.js';
 import { World } from './world.js';
 import { AudioManager } from './audio.js';
 import { Hangar } from './hangar.js';
-import { Player, Drone, Wrecker, Turret, Bullet, ParticleSystem } from './entities.js';
+import { Player, Drone, Wrecker, Turret, Bullet, AmmoBox, ParticleSystem } from './entities.js';
+import { ARMOR_MELT_AT, HEAT_DAMAGE_AT } from './weapons.js';
 import { clamp, rand, aabb } from './utils.js';
 
 const BEST_KEY = 'mechiavellan.best';
+
+/** Chance that a destroyed enemy leaves an ammo crate behind. */
+const AMMO_DROP_CHANCE = 0.35;
+const MAX_AMMO_BOXES = 6;
 
 /** Distance the mech must cover to reach the extraction beacon. */
 const OBJECTIVE_METERS = 1500;
@@ -51,6 +56,8 @@ export class Game {
     this.particles = new ParticleSystem();
     this.bullets = [];
     this.enemies = [];
+    this.ammoBoxes = [];
+    this.pendingBullets = [];
     this.player = null;
     this.loadout = null;
 
@@ -126,6 +133,8 @@ export class Game {
     this.player.y = this.world.groundY(this.player.x + this.player.w / 2) - this.player.h - 30;
     this.bullets.length = 0;
     this.enemies.length = 0;
+    this.ammoBoxes.length = 0;
+    this.pendingBullets.length = 0;
     this.particles.clear();
     this.camera.x = this.player.x - this.view.w * 0.35;
     this.spawnTimer = 1.5;
@@ -175,11 +184,19 @@ export class Game {
       audio: this.audio,
       enemies: this.enemies,
       spawnBullet: (b) => this.bullets.push(b),
+      killEnemy: (enemy) => this.killEnemy(enemy),
     };
 
     this.player.update(dt, ctx);
     for (const enemy of this.enemies) enemy.update(dt, ctx);
-    for (const bullet of this.bullets) bullet.update(dt, ctx);
+
+    for (const bullet of this.bullets) {
+      const wasAlive = !bullet.dead;
+      bullet.update(dt, ctx);
+      if (wasAlive && bullet.dead) this.onBulletDeath(bullet);
+    }
+
+    for (const box of this.ammoBoxes) box.update(dt, ctx);
     this.particles.update(dt);
 
     const targetX = this.player.x - this.view.w * 0.35;
@@ -206,6 +223,7 @@ export class Game {
       (b) => !b.dead && Math.abs(b.x - this.camera.x - this.view.w / 2) < far
     );
     this.enemies = this.enemies.filter((e) => !e.dead);
+    this.ammoBoxes = this.ammoBoxes.filter((b) => !b.dead);
 
     this.distance = Math.max(this.distance, Math.max(0, this.player.x - 180));
     this.score = this.kills * 100 + Math.floor(this.distance / 12);
@@ -265,6 +283,9 @@ export class Game {
   }
 
   killEnemy(enemy, award = true) {
+    if (enemy.killed) return;
+    enemy.killed = true;
+
     this.particles.spawnExplosion(
       enemy.x + enemy.w / 2,
       enemy.y + enemy.h / 2,
@@ -273,10 +294,86 @@ export class Game {
     );
     this.audio.explode();
     this.shake = Math.max(this.shake, 6);
-    if (award) this.kills += 1;
+
+    if (!award) return;
+    this.kills += 1;
+    if (this.ammoBoxes.length < MAX_AMMO_BOXES && Math.random() < AMMO_DROP_CHANCE) {
+      this.ammoBoxes.push(new AmmoBox(enemy.x + enemy.w / 2, enemy.y + enemy.h / 2));
+    }
+  }
+
+  /**
+   * Splash damage and submunitions, applied exactly once per projectile however
+   * it died (impact or expiry).
+   */
+  onBulletDeath(bullet) {
+    if (bullet.deathHandled) return;
+    bullet.deathHandled = true;
+
+    if (bullet.splash > 0) {
+      this.particles.spawnExplosion(bullet.x, bullet.y, 16, bullet.color);
+      this.shake = Math.max(this.shake, 4);
+
+      if (bullet.friendly) {
+        for (const enemy of this.enemies) {
+          if (enemy.dead) continue;
+          const dx = enemy.x + enemy.w / 2 - bullet.x;
+          const dy = enemy.y + enemy.h / 2 - bullet.y;
+          const reach = bullet.splash + Math.max(enemy.w, enemy.h) / 2;
+          if (Math.hypot(dx, dy) > reach) continue;
+          if (enemy.hit(bullet.splashDamage)) this.killEnemy(enemy);
+        }
+      } else {
+        const dx = this.player.cx - bullet.x;
+        const dy = this.player.cy - bullet.y;
+        if (Math.hypot(dx, dy) < bullet.splash + 24) {
+          if (this.player.takeDamage(bullet.splashDamage)) this.audio.hurt();
+        }
+      }
+    }
+
+    if (bullet.fragments > 0) {
+      const base = bullet.angle;
+      for (let i = 0; i < bullet.fragments; i++) {
+        const t = bullet.fragments === 1 ? 0.5 : i / (bullet.fragments - 1);
+        const a = base + (t - 0.5) * 2 * bullet.fragmentSpread;
+        this.pendingBullets.push(
+          new Bullet({
+            x: bullet.x,
+            y: bullet.y,
+            vx: Math.cos(a) * bullet.fragmentSpeed,
+            vy: Math.sin(a) * bullet.fragmentSpeed,
+            friendly: bullet.friendly,
+            damage: bullet.fragmentDamage,
+            color: bullet.color,
+            w: 7,
+            h: 7,
+            life: bullet.fragmentLife,
+            kind: bullet.kind,
+            divergence: (Math.random() * 2 - 1) * 0.12,
+          })
+        );
+      }
+      this.particles.spawnSparks(bullet.x, bullet.y, 8, bullet.color);
+    }
   }
 
   handleCollisions() {
+    // Enemy fire can shoot incoming missiles out of the air.
+    for (const hostile of this.bullets) {
+      if (hostile.dead || hostile.friendly) continue;
+      for (const missile of this.bullets) {
+        if (missile.dead || !missile.friendly || !missile.interceptable) continue;
+        if (!aabb(hostile.box, missile.box)) continue;
+        hostile.dead = true;
+        missile.dead = true;
+        this.onBulletDeath(missile);
+        this.particles.spawnExplosion(missile.x, missile.y, 12, '#ffd257');
+        this.audio.hit();
+        break;
+      }
+    }
+
     for (const bullet of this.bullets) {
       if (bullet.dead) continue;
 
@@ -289,23 +386,21 @@ export class Game {
           bullet.hits.add(enemy);
           this.particles.spawnSparks(bullet.x, bullet.y, 5);
 
-          const killed = enemy.hit(bullet.damage);
-          if (killed) {
-            this.killEnemy(enemy);
-          } else {
-            this.audio.hit();
-          }
+          if (enemy.hit(bullet.damage)) this.killEnemy(enemy);
+          else this.audio.hit();
 
           // Piercing rounds keep going until their extra hits run out.
           if (bullet.pierce > 0) {
             bullet.pierce -= 1;
           } else {
             bullet.dead = true;
+            this.onBulletDeath(bullet);
             break;
           }
         }
       } else if (aabb(bullet.box, this.player)) {
         bullet.dead = true;
+        this.onBulletDeath(bullet);
         if (this.player.takeDamage(bullet.damage)) {
           this.audio.hurt();
           this.shake = Math.max(this.shake, 8);
@@ -331,11 +426,26 @@ export class Game {
       }
     }
 
+    // Ammo crates.
+    for (const box of this.ammoBoxes) {
+      if (box.dead || !aabb(box, this.player)) continue;
+      if (!this.player.resupply()) continue;
+      box.dead = true;
+      this.particles.spawnSparks(box.x + box.w / 2, box.y + box.h / 2, 12, '#7fe6ff');
+      this.audio.tone({ freq: 680, type: 'triangle', duration: 0.14, gain: 0.045, sweep: 320 });
+    }
+
     // With enemies on both sides, only cull things that are genuinely gone.
     const behindLimit = this.camera.x - this.view.w * 1.1;
     const aheadLimit = this.camera.x + this.view.w * 2;
     for (const enemy of this.enemies) {
       if (enemy.x + enemy.w < behindLimit || enemy.x > aheadLimit) enemy.dead = true;
+    }
+
+    // Submunitions spawned above only join the pool once this pass is done.
+    if (this.pendingBullets.length) {
+      this.bullets.push(...this.pendingBullets);
+      this.pendingBullets.length = 0;
     }
   }
 
@@ -360,8 +470,10 @@ export class Game {
       ctx.translate(-Math.round(this.camera.x), 0);
       this.drawBeacon(ctx);
       this.particles.draw(ctx);
+      if (this.player) this.player.drawBeams(ctx);
       for (const enemy of this.enemies) enemy.draw(ctx);
       if (this.player && !this.player.dead) this.player.draw(ctx);
+      for (const box of this.ammoBoxes) box.draw(ctx);
       for (const bullet of this.bullets) bullet.draw(ctx);
       ctx.restore();
     }
@@ -414,28 +526,52 @@ export class Game {
     ctx.fillStyle = '#9fb3d1';
     ctx.fillText(`HULL · ${this.player.frame.name.toUpperCase()}`, x, y + barH + 15);
 
-    // Heat sink: how close the mech is to saturating and being forced to vent.
+    // Heat sink, with the two danger thresholds marked on the bar.
     const heatY = y + barH + 30;
+    const heatH = 12;
     ctx.fillStyle = 'rgba(8, 12, 22, 0.7)';
-    ctx.fillRect(x - 4, heatY - 4, barW + 8, 20);
+    ctx.fillRect(x - 4, heatY - 4, barW + 8, heatH + 8);
     ctx.fillStyle = '#2a3346';
-    ctx.fillRect(x, heatY, barW, 12);
+    ctx.fillRect(x, heatY, barW, heatH);
 
     const heat = this.player.heatRatio;
     const heatGrad = ctx.createLinearGradient(x, 0, x + barW, 0);
     heatGrad.addColorStop(0, '#8fe9ff');
-    heatGrad.addColorStop(0.6, '#ffd257');
-    heatGrad.addColorStop(1, '#ff5d5d');
+    heatGrad.addColorStop(ARMOR_MELT_AT, '#ffd257');
+    heatGrad.addColorStop(1, '#ff3b3b');
     ctx.fillStyle = heatGrad;
-    ctx.fillRect(x, heatY, barW * heat, 12);
+    ctx.fillRect(x, heatY, barW * heat, heatH);
+
+    ctx.strokeStyle = 'rgba(255, 255, 255, 0.35)';
+    ctx.lineWidth = 1;
+    ctx.beginPath();
+    ctx.moveTo(x + barW * ARMOR_MELT_AT, heatY);
+    ctx.lineTo(x + barW * ARMOR_MELT_AT, heatY + heatH);
+    ctx.moveTo(x + barW * HEAT_DAMAGE_AT, heatY);
+    ctx.lineTo(x + barW * HEAT_DAMAGE_AT, heatY + heatH);
+    ctx.stroke();
+
     ctx.strokeStyle = this.player.overheated
-      ? 'rgba(255, 90, 90, 0.9)'
+      ? 'rgba(255, 90, 90, 0.95)'
       : 'rgba(120, 180, 220, 0.5)';
-    ctx.strokeRect(x + 0.5, heatY + 0.5, barW, 12);
+    ctx.strokeRect(x + 0.5, heatY + 0.5, barW, heatH);
+
+    let heatLabel = 'HEAT';
+    let heatColor = '#9fb3d1';
+    if (this.player.overheated) {
+      heatLabel = 'OVERHEATED — VENTING';
+      heatColor = '#ff5d5d';
+    } else if (this.player.heatDamage > 0) {
+      heatLabel = 'HULL BURNING';
+      heatColor = '#ff5d5d';
+    } else if (heat > ARMOR_MELT_AT) {
+      heatLabel = `ARMOUR MELTING (${this.player.effectiveArmor.toFixed(1)})`;
+      heatColor = '#ffd257';
+    }
 
     ctx.font = '600 11px ui-monospace, SFMono-Regular, Menlo, monospace';
-    ctx.fillStyle = this.player.overheated ? '#ff7a6b' : '#9fb3d1';
-    ctx.fillText(this.player.overheated ? 'HEAT · VENTING' : 'HEAT', x, heatY + 12 + 12);
+    ctx.fillStyle = heatColor;
+    ctx.fillText(heatLabel, x, heatY + heatH + 12);
 
     ctx.textAlign = 'right';
     ctx.fillStyle = '#dfeaff';
@@ -448,66 +584,104 @@ export class Game {
     ctx.restore();
   }
 
-  /** One tile per installed hardpoint, showing its name and reload state. */
+  /** One tile per hardpoint: weapon, hotkey, bank, ammo and reload state. */
   drawWeaponRack(ctx) {
     const weapons = this.player.weaponDefs;
     if (!weapons.length) return;
 
     const { w, h } = this.view;
-    const boxW = 104;
-    const boxH = 34;
+    const boxW = 108;
+    const boxH = 44;
     const gap = 8;
     const total = weapons.length * boxW + (weapons.length - 1) * gap;
     let x = (w - total) / 2;
-    const y = h - 52;
+    const y = h - 62;
 
     ctx.save();
     ctx.textBaseline = 'middle';
-    ctx.textAlign = 'left';
+    ctx.textAlign = 'center';
 
-    // Reactor status: heat state is what the player needs to read mid-fight.
+    // Which way the independent bank is aimed.
+    ctx.font = '700 11px ui-monospace, SFMono-Regular, Menlo, monospace';
+    ctx.fillStyle = '#8fa6c9';
+    ctx.fillText(`BANK B: ${this.player.bankModeName}   [V]`, w / 2, y - 24);
+
     const status = this.player.overheated
       ? { text: 'OVERHEAT — VENTING', color: '#ff7a6b' }
-      : this.player.cycleScale > 1.05
-        ? { text: `HEAT THROTTLE ×${this.player.cycleScale.toFixed(2)}`, color: '#ffd257' }
-        : null;
+      : this.player.heatDamage > 0
+        ? { text: 'HULL BURNING — CEASE FIRE', color: '#ff5d5d' }
+        : this.player.cycleScale > 1.05
+          ? { text: `HEAT THROTTLE ×${this.player.cycleScale.toFixed(2)}`, color: '#ffd257' }
+          : null;
 
     if (status) {
-      ctx.textAlign = 'center';
       ctx.font = '700 12px ui-monospace, SFMono-Regular, Menlo, monospace';
       ctx.fillStyle = status.color;
-      ctx.fillText(status.text, w / 2, y - 10);
-      ctx.textAlign = 'left';
+      ctx.fillText(status.text, w / 2, y - 8);
     }
+
+    ctx.textAlign = 'left';
 
     for (let i = 0; i < weapons.length; i++) {
       const weapon = weapons[i];
+      const bank = i % 2;
       const cooldown = this.player.cooldowns[i];
-      const ready = weapon.cooldown > 0 ? clamp(1 - cooldown / weapon.cooldown, 0, 1) : 1;
+      const reload = this.player.reloadTimers[i];
+      const mag = this.player.mag[i];
+      const reserve = this.player.reserve[i];
+      const effectiveCooldown = weapon.cooldown * this.player.cycleScale;
+      const ready =
+        effectiveCooldown > 0 ? clamp(1 - cooldown / effectiveCooldown, 0, 1) : 1;
+      const dry = !!weapon.ammo && mag <= 0 && reserve <= 0;
 
       ctx.fillStyle = 'rgba(8, 12, 22, 0.72)';
       ctx.fillRect(x, y, boxW, boxH);
-      ctx.strokeStyle = ready >= 1 ? 'rgba(127, 230, 255, 0.9)' : 'rgba(90, 110, 140, 0.5)';
+      ctx.strokeStyle =
+        reload > 0
+          ? 'rgba(255, 177, 92, 0.8)'
+          : ready >= 1
+            ? 'rgba(127, 230, 255, 0.9)'
+            : 'rgba(90, 110, 140, 0.5)';
       ctx.lineWidth = 1;
       ctx.strokeRect(x + 0.5, y + 0.5, boxW - 1, boxH - 1);
 
       ctx.font = '700 14px ui-monospace, SFMono-Regular, Menlo, monospace';
-      ctx.fillStyle = ready >= 1 ? weapon.color : '#6f83a3';
-      ctx.fillText(weapon.abbr, x + 8, y + 12);
+      ctx.fillStyle = dry ? '#6f83a3' : weapon.color;
+      ctx.fillText(weapon.abbr, x + 8, y + 13);
 
-      ctx.font = '600 9px ui-monospace, SFMono-Regular, Menlo, monospace';
-      ctx.fillStyle = '#7f93b8';
-      ctx.fillText(weapon.klass.toUpperCase(), x + 8, y + 24);
-
-      // Hotkey: hold this number to fire only this hardpoint.
+      // Hotkey plus which bank it belongs to.
       ctx.textAlign = 'right';
-      ctx.font = '700 10px ui-monospace, SFMono-Regular, Menlo, monospace';
-      ctx.fillStyle = '#8fa6c9';
-      ctx.fillText(String(i + 1), x + boxW - 8, y + 12);
+      ctx.font = '700 11px ui-monospace, SFMono-Regular, Menlo, monospace';
+      ctx.fillStyle = bank === 0 ? '#7fe6ff' : '#ffb15c';
+      ctx.fillText(`${i + 1}${bank === 0 ? 'A' : 'B'}`, x + boxW - 8, y + 13);
       ctx.textAlign = 'left';
 
-      ctx.fillStyle = 'rgba(127, 230, 255, 0.85)';
-      ctx.fillRect(x + 8, y + boxH - 6, (boxW - 16) * ready, 2);
+      ctx.font = '600 10px ui-monospace, SFMono-Regular, Menlo, monospace';
+      if (weapon.ammo) {
+        ctx.fillStyle = dry ? '#ff5d5d' : reload > 0 ? '#ffb15c' : '#9fb3d1';
+        ctx.fillText(`${mag}/${reserve}`, x + 8, y + 26);
+      } else {
+        ctx.fillStyle = '#6f83a3';
+        ctx.fillText('ENERGY', x + 8, y + 26);
+      }
+
+      // Charge progress for charge-up weapons (rail cannon).
+      if (weapon.mode === 'charge') {
+        const charge = this.player.charges[i] / weapon.charge;
+        if (charge > 0) {
+          ctx.fillStyle = 'rgba(127, 230, 255, 0.95)';
+          ctx.fillRect(x + 8, y + 33, (boxW - 16) * clamp(charge, 0, 1), 3);
+        }
+      }
+
+      if (reload > 0) {
+        const progress = 1 - reload / weapon.ammo.reload;
+        ctx.fillStyle = '#ffb15c';
+        ctx.fillRect(x + 8, y + boxH - 7, (boxW - 16) * clamp(progress, 0, 1), 3);
+      } else {
+        ctx.fillStyle = 'rgba(127, 230, 255, 0.85)';
+        ctx.fillRect(x + 8, y + boxH - 7, (boxW - 16) * ready, 3);
+      }
 
       x += boxW + gap;
     }

@@ -210,6 +210,17 @@ body {
   color: #93a7c4;
 }
 
+.card__ammo {
+  margin: 8px 0 0;
+  font-size: 10px;
+  letter-spacing: 0.06em;
+  color: #ffb15c;
+}
+
+.card__ammo--free {
+  color: #7fe6ff;
+}
+
 .stats {
   display: grid;
   grid-template-columns: repeat(4, 1fr);

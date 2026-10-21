@@ -9,7 +9,7 @@ export class Input {
     this.canvas = canvas;
     this.down = new Set();
     this.justPressed = new Set();
-    this.mouse = { x: 0, y: 0, down: false, clicked: false };
+    this.mouse = { x: 0, y: 0, down: false, rightDown: false, clicked: false };
 
     const scrollKeys = new Set([
       'Space',
@@ -31,6 +31,7 @@ export class Input {
     window.addEventListener('blur', () => {
       this.down.clear();
       this.mouse.down = false;
+      this.mouse.rightDown = false;
     });
 
     // Mouse coordinates are kept in CSS pixels to match the render space.
@@ -44,11 +45,17 @@ export class Input {
       if (e.button === 0) {
         this.mouse.down = true;
         this.mouse.clicked = true;
+      } else if (e.button === 2) {
+        // Right button drives the second weapon bank, so it must not open a
+        // context menu.
+        this.mouse.rightDown = true;
+        e.preventDefault();
       }
     });
 
     window.addEventListener('mouseup', (e) => {
       if (e.button === 0) this.mouse.down = false;
+      if (e.button === 2) this.mouse.rightDown = false;
     });
 
     canvas.addEventListener('contextmenu', (e) => e.preventDefault());

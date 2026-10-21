@@ -4,8 +4,7 @@ A 2D side-scrolling mech shooter built around **customization above everything
 else**. Before you deploy you build your machine in the hangar — chassis, then
 hardpoints, then weapons — and the machine you build genuinely plays differently.
 
-There is also now a way to *win*: cross 1500 m of hostile ground and reach the
-extraction beacon.
+There is a way to *win*: cross 1500 m of hostile ground to the extraction beacon.
 
 > *mech* + *Machiavellian* = **Mechiavellan**
 
@@ -21,81 +20,107 @@ blocked by browser CORS rules), so start any static server from this folder:
 python3 -m http.server 8000
 ```
 
-Then open <http://localhost:8000>. Any static server works.
+Then open <http://localhost:8000>.
 
 ## The hangar
 
 The game opens in the hangar. Pick a chassis, fill its hardpoints, hit
-**DEPLOY**. Reopen the hangar from the game-over or victory screen with `H`, or
-press `Enter` to redeploy the same loadout.
+**DEPLOY**. Reopen it from the game-over/victory screen with `H`, or `Enter` to
+redeploy the same loadout.
 
-1. **Chassis** — how many hardpoints you get, plus hull, speed, agility, armour
-   and heat sink.
-2. **Hardpoints** — select a weapon in the armory, click a hardpoint to install
-   it, click a filled hardpoint to clear it. Duplicates are allowed. The readout
-   under the slots shows the loadout's heat balance, burst and sustained damage.
-3. **Armory** — the full weapon list.
+1. **Chassis** — hardpoint count, hull, speed, agility, armour and heat sink.
+2. **Hardpoints** — select a weapon, click a hardpoint to install; click a filled
+   hardpoint to clear it. Duplicates allowed. The readout shows the loadout's
+   heat balance, burst and sustained damage, and how many hardpoints need ammo.
+3. **Armory** — every weapon, with its delivery mode, range, damage and ammo.
 
-### Chassis
+## Weapons: ten very different things
 
-Every chassis has the **same radiator** (14 heat/s) and the same heat-to-damage
-ratio, so they end up doing nearly the same *sustained* damage. What differs is
-how hard they can hit in a burst, and how well they avoid being hit.
+Weapons are not a damage number at a different rate. Each has a distinct
+delivery, shown on its card:
 
-| Frame | Hardpoints | Hull | Speed | Jump | Armor | Heat sink |
-| --- | --- | --- | --- | --- | --- | --- |
-| WRAITH-2 (Light) | 2 | 100 | 470 | 910 | 0 | 55 |
-| BASTION-4 (Medium) | 4 | 135 | 385 | 830 | 1 | 85 |
-| LEVIATHAN-6 (Large) | 6 | 165 | 290 | 700 | 2 | 115 |
+| Weapon | Class | Mode | What makes it different |
+| --- | --- | --- | --- |
+| Vulcan Autocannon | Ballistic | Direct fire | Belt-fed stream, 480 rounds, huge spread |
+| Battle Autocannon | Ballistic | **Burst fire** | Three-round bursts, accurate, paces your heat |
+| Scatter Cannon | Ballistic | Direct fire | 6 pellets, brutal at contact range only |
+| Flak Cannon | Ballistic | Direct fire | Shell that **cracks into 6 fragments** at end of flight |
+| Rail Cannon | Energy | **Charge-up** | Hold to spool, releases at full power, **pierces 4** |
+| Beam Laser | Energy | **Continuous beam** | Hitscan ray, no ammo, pours heat in while it burns |
+| Arc Emitter | Energy | **Chain arc** | Lightning that leaps to 2 further targets |
+| Plasma Projector | Energy | Direct fire | Slow fat projectile with a **110 px splash** |
+| Missile Pod | Missile | Direct fire | 2 homing missiles, hot launch, **can be shot down** |
+| Flamer Warfer | Thermal | Direct fire | **Double-wide cone** that fans out as it travels |
 
-### How the frames stay level
+### Ammo vs heat: the real build choice
 
-A naive design has a fatal flaw: six guns is three times the damage for slightly
-less speed. Instead, **firing builds heat and heat throttles your rate of fire**:
+Only six weapons carry ammo, and that is the point of the axis.
+
+- **Ballistic / missile** weapons hit hard, run relatively cool, and **run dry**.
+  Each has a magazine, a reload time and a reserve. Running empty triggers an
+  automatic reload (`R` reloads everything manually).
+- **Energy** weapons never need a box of shells, but they cook you alive.
+
+Destroyed enemies drop **ammo crates** roughly a third of the time. Walk over one
+and every ammo-fed hardpoint gains a magazine's worth of reserve (capped at four
+magazines). No crates, no ballistics.
+
+Burning ammo also **adds heat on top of the weapon's own** (`AMMO_HEAT` per
+round), so holding the trigger on a belt-fed gun heats you faster than the weapon
+card alone suggests.
+
+### Heat is now dangerous
 
 ```
 heatRatio  = heat / heatSink
 cycleScale = 1 + heatRatio * 1.6        // multiplies every weapon's cooldown
 ```
 
-At a steady state, heat generated equals heat shed, so:
+Escalating consequences:
 
-```
-sustained dps ~= cooling * (sum of dps) / (sum of heat)
-```
+| Heat | Effect |
+| --- | --- |
+| any | Rate of fire throttles — the hotter you are, the slower everything cycles |
+| > 55% | **Armour plating melts.** Flat damage reduction scales to zero at 100% |
+| > 80% | **The hull itself burns**, up to 10 hp/s at maximum heat |
+| 100% | **OVERHEAT** — weapons lock until the sink vents to 35% |
 
-Note what is *absent*: the number of hardpoints. Because every chassis cools at
-the same rate, and each weapon's heat cost is set to roughly its damage-per-second
-divided by ten, **sustained damage comes out within about 10% whichever frame you
-pick** (measured: 138 / 145 / 147 dps). What the frame buys you is **burst** —
-138 / 275 / 412 dps — and burst is paid for with speed, size and a vent cycle.
+Sustained damage still works out to about `cooling × (sum of dps) / (sum of
+heat)` — note the absence of hardpoint count, which is what stops six guns being
+three times the damage. Measured on identical loadouts, the three chassis land
+within **1.07×** of each other on sustained damage, while burst scales **2.9×**.
 
-Practical consequences:
+## Firing in two directions
 
-- The **light frame never overheats**. It just keeps firing, forever.
-- The **medium frame** settles at roughly double cooldown and holds there.
-- The **large frame** cannot settle: it saturates its sink, stops firing while it
-  vents, then does it again. Huge opening volley, then a breather.
-- Filling every hardpoint is always better than leaving one empty, so there is no
-  degenerate under-filled build.
+Hardpoints alternate between two banks:
 
-### Armory
+| | Hardpoints | Aim | Fire |
+| --- | --- | --- | --- |
+| **Bank A** | even slots (1st, 3rd, 5th) | the cursor | left mouse / `J` |
+| **Bank B** | odd slots (2nd, 4th, 6th) | independent | right mouse / `K` |
 
-| Weapon | Class | Dmg | Rate | Heat | Range |
-| --- | --- | --- | --- | --- | --- |
-| Vulcan Autocannon | Ballistic | 6 | 11.1/s | 6.7 | 735 px |
-| Battle Autocannon | Ballistic | 14 | 3.6/s | 5.0 | 990 px |
-| Pulse Laser | Energy | 11 | 6.2/s | 6.9 | 1250 px |
-| Plasma Projector | Energy | 38 | 1.1/s | 4.4 | 992 px |
-| Scatter Cannon | Ballistic | 7 ×5 | 1.3/s | 4.9 | 440 px |
-| Missile Pod | Missile | 24 ×2 | 1.4/s | 7.0 | 1034 px |
-| Rail Cannon | Energy | 62 | 0.7/s | 4.5 | 2160 px |
-| Inferno Flamer | Thermal | 3 | 22.2/s | 6.7 | 234 px |
+`V` cycles what bank B does:
 
-Range is `speed × lifetime`, so the flamer dies at arm's length while the rail
-cannon reaches across the screen. Every weapon's damage-per-heat sits in a
-9.5–10.0 band, so no weapon is a strictly better use of your heat budget than
-any other — you pick on range, delivery and feel.
+- **REAR** (default) — auto-tracks the nearest enemy *behind* you, so you can
+  fight forward and backward at once.
+- **MIRROR** — exactly opposite your cursor.
+- **SYNC** — same direction as bank A.
+
+The rack labels each hardpoint with its hotkey and bank (`1A`, `2B`, …). `1`–`6`
+fires a single hardpoint on its own, which is how you manage heat on a six-gun
+chassis.
+
+## Chassis
+
+| Frame | Hardpoints | Hull | Speed | Jump | Armor | Heat sink |
+| --- | --- | --- | --- | --- | --- | --- |
+| WRAITH-2 (Light) | 2 | 100 | 470 | 910 | 0 | 30 |
+| BASTION-4 (Medium) | 4 | 135 | 385 | 830 | 1 | 40 |
+| LEVIATHAN-6 (Large) | 6 | 165 | 290 | 700 | 2 | 55 |
+
+Every chassis cools at the same rate (8/s), so they end up doing nearly the same
+*sustained* damage. What differs is burst, speed, size and how long you can hold
+the trigger before the sink saturates.
 
 ## Controls
 
@@ -103,61 +128,53 @@ any other — you pick on range, delivery and feel.
 | --- | --- |
 | Move | `A` / `D` or `←` / `→` |
 | Jump | `Space` / `W` / `↑` |
-| Aim | mouse |
-| Fire every ready hardpoint | left mouse button / `J` |
-| **Fire one hardpoint on its own** | **hold `1` … `6`** |
+| Aim (bank A) | mouse |
+| Fire bank A | left mouse / `J` |
+| Fire bank B | right mouse / `K` |
+| Fire one hardpoint | hold `1` … `6` |
+| Cycle bank B mode | `V` |
+| Reload everything | `R` |
 | Deploy / redeploy | `Enter` |
-| Return to hangar | `H` (from the game-over / victory screen) |
-
-Firing individually matters: with a six-gun chassis, firing everything at once is
-how you saturate your heat sink, so nibbling with two or three hardpoints is often
-better than holding the trigger. The weapon rack along the bottom labels each
-hardpoint with its hotkey and shows its reload state.
+| Return to hangar | `H` |
 
 ## Winning
 
-The objective is to travel **1500 m** and reach the **extraction beacon** — a
-glowing pad with a light beam, visible on the ground as you approach. A progress
-bar sits at the top of the screen. Reaching it is worth a 1000-point bonus and
-ends the run in victory rather than death.
+Travel **1500 m** to the extraction beacon — a glowing pad with a light beam,
+tracked by a progress bar at the top of the screen. Reaching it is worth a
+1000-point bonus and ends the run in victory rather than death. A garrison of
+five enemies guards the pad, and enemies spawn **from both directions** (~35%
+from behind), so a flat-out sprint has a real cost.
 
-It is not just a sprint. A garrison of five enemies is waiting near the pad, and
-enemies now spawn **from both directions**, so running flat out means ploughing
-into things from the front while being chased from behind.
+### Enemies
 
-## Enemies
-
-- **Drone** — fast hoverer that flies straight at you and detonates on contact.
-- **Wrecker** — armored walker that closes in for melee.
-- **Turret** — stationary; fires aimed shots. Only ever ahead of you (a static gun
-  behind you would just be culled).
-
-Roughly a third of spawns arrive **behind** you, so you cannot simply back away
-from trouble. Spawn rate ramps up as you approach the extraction point.
+- **Drone** — fast hoverer that detonates on contact.
+- **Wrecker** — armored walker that closes for melee.
+- **Turret** — stationary, aimed shots, only ever ahead of you.
 
 ## Project layout
 
 ```
-index.html          canvas + the hangar overlay markup
+index.html          canvas + hangar overlay markup
 css/style.css       game shell, hangar UI, responsive layout
-js/weapons.js       frames + the 8 weapons + the heat model (pure, no rendering)
+js/weapons.js       frames, the 10 weapons, ammo + heat model (pure data/maths)
 js/hangar.js        loadout UI: chassis -> hardpoints -> armory
 js/main.js          bootstrap
-js/game.js          state machine (hangar -> playing -> victory/game over), the
-                    extraction objective, spawning, collisions, camera, HUD
-js/entities.js      player mech (loadout + heat driven), 3 enemies, bullets, particles
+js/game.js          state machine, extraction objective, spawning, collisions
+                    (splash, submunitions, missile interception, ammo crates)
+js/entities.js      player mech (per-hardpoint ammo/heat/burst/charge, dual-bank
+                    aiming, beam + chain delivery), 3 enemies, bullets, crates
 js/world.js         parallax backdrop + curved terrain
-js/input.js         keyboard + mouse with per-frame edge detection
+js/input.js         keyboard + mouse (both buttons), per-frame edge detection
 js/audio.js         Web Audio synth sound effects
 js/utils.js         math helpers
 ```
 
 The hangar is a DOM overlay rather than canvas UI — real buttons and focus rings
-beat hand-rolled canvas hit-testing for something this central. The simulation
-only ever sees a `{ frame, weapons }` loadout, so UI and game stay decoupled.
+beat hand-rolled hit-testing for something this central. The simulation only ever
+sees a `{ frame, weapons }` loadout.
 
 ## Where this is going
 
-Customization is the whole point, so the next steps are part-by-part mech building
-(legs, reactor, armour plating, heat sinks and radiators as separate parts),
-weapon mass limits, per-hardpoint placement, and loadout save/export.
+Part-by-part mech building (legs, reactor, plating, radiators as separate parts),
+weapon mass limits, per-hardpoint placement in a painter, and loadout
+save/export.

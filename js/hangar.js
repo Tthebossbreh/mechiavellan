@@ -18,7 +18,16 @@ import {
   willOverheat,
 } from './weapons.js';
 
-const DEFAULT_WEAPON_IDS = ['vulcan', 'autocannon', 'pulse', 'missiles', 'scatter', 'railgun'];
+const DEFAULT_WEAPON_IDS = ['vulcan', 'burst', 'plasma', 'missiles', 'shotgun', 'railgun'];
+
+/** Human-readable delivery mode, so the card says *how* a gun works. */
+const MODE_LABELS = {
+  projectile: 'Direct fire',
+  burst: 'Burst fire',
+  charge: 'Charge-up',
+  beam: 'Continuous beam',
+  chain: 'Chain arc',
+};
 
 /** Power draw can be fractional; show "14" rather than "14.0". */
 function fmt(value) {
@@ -169,15 +178,22 @@ export class Hangar {
       card.type = 'button';
       card.className = 'card card--weapon';
       card.dataset.weapon = weapon.id;
+      const rateText =
+        weapon.mode === 'beam' ? 'continuous' : `${fireRate(weapon).toFixed(1)}/s`;
+      const ammoText = weapon.ammo
+        ? `AMMO ${weapon.ammo.magazine}/mag · ${weapon.ammo.reserve} spare · ${weapon.ammo.reload}s reload`
+        : 'NO AMMO — heat only';
+
       card.innerHTML = `
-        <span class="card__tag">${weapon.klass}</span>
+        <span class="card__tag">${weapon.klass} · ${MODE_LABELS[weapon.mode] || weapon.mode}</span>
         <h3 class="card__title">${weapon.name}</h3>
         <p class="card__code">${weapon.abbr} · ${Math.round(weaponRange(weapon))} px range</p>
         <dl class="stats stats--compact">
           <div><dt>Dmg</dt><dd>${burstDamage(weapon)}</dd></div>
-          <div><dt>Rate</dt><dd>${fireRate(weapon).toFixed(1)}/s</dd></div>
+          <div><dt>Rate</dt><dd>${rateText}</dd></div>
           <div><dt>Heat</dt><dd>${weapon.heat}/s</dd></div>
         </dl>
+        <p class="card__ammo ${weapon.ammo ? '' : 'card__ammo--free'}">${ammoText}</p>
         <p class="card__blurb">${weapon.blurb}</p>`;
       card.addEventListener('click', () => this._selectWeapon(weapon));
       this.els.weaponCards.appendChild(card);
@@ -224,6 +240,7 @@ export class Hangar {
     const heat = totalHeatRate(weapons);
     const burst = burstDps(weapons);
     const sustain = sustainedDps(f, weapons);
+    const ammoCount = weapons.filter((w) => w && w.ammo).length;
 
     let heatText;
     if (heat <= f.cooling) {
@@ -239,7 +256,8 @@ export class Hangar {
       `jump ${f.jump} · armor ${f.armor}<br>` +
       `<strong>HEAT ${fmt(heat)}/s vs cooling ${f.cooling}/s</strong> · ${heatText}<br>` +
       `burst <strong>${Math.round(burst)} dps</strong> · sustained ` +
-      `<strong>${Math.round(sustain)} dps</strong>`;
+      `<strong>${Math.round(sustain)} dps</strong> · ` +
+      `${ammoCount}/${weapons.filter(Boolean).length || 0} hardpoints need ammo`;
 
     const armed = this.slots.filter(Boolean).length;
     const empty = f.slots - armed;
