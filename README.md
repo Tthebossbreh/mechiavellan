@@ -178,3 +178,10 @@ sees a `{ frame, weapons }` loadout.
 Part-by-part mech building (legs, reactor, plating, radiators as separate parts),
 weapon mass limits, per-hardpoint placement in a painter, and loadout
 save/export.
+
+We made a mecha game where the player designs a robot, then fights others with it.
+We got to making different frames and weapons, with heat and ammo as factors.
+The agent did well, and did not misunderstand anything.
+We made no request too big for the agent.
+We barely understood what the agent said, but it explained things and we clicked links and things just worked.
+I spent 15 cents on tokens.
