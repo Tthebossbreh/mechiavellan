@@ -3,15 +3,54 @@
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
-    <meta name="description" content="Mechiavellan - a tiny 2D scrolling mech shooter." />
+    <meta
+      name="description"
+      content="Mechiavellan - a 2D scrolling mech shooter built around mech customization."
+    />
     <title>Mechiavellan</title>
     <link rel="stylesheet" href="css/style.css" />
   </head>
   <body>
-    <div id="app">
-      <canvas id="game"></canvas>
+    <canvas id="game"></canvas>
+    <p id="hint">A / D move &middot; SPACE jump &middot; MOUSE aim &middot; CLICK or J fire &middot; H hangar</p>
+
+    <div id="hangar" class="hangar">
+      <header class="hangar__head">
+        <h1>MECHIAVELLAN</h1>
+        <p class="hangar__sub">Hangar &mdash; configure your machine before deployment</p>
+      </header>
+
+      <div class="hangar__body">
+        <section class="panel">
+          <h2><span>1</span> Chassis</h2>
+          <div class="cards" id="frame-cards"></div>
+        </section>
+
+        <section class="panel">
+          <h2>
+            <span>2</span> Hardpoints
+            <button id="clear-loadout" class="ghost" type="button">Clear all</button>
+          </h2>
+          <div class="slots" id="hardpoints"></div>
+          <p class="stat-line" id="frame-stats"></p>
+          <p class="help">
+            Pick a weapon from the armory, then click a hardpoint to install it.
+            Click a filled hardpoint to clear it.
+          </p>
+        </section>
+
+        <section class="panel">
+          <h2><span>3</span> Armory</h2>
+          <div class="cards cards--weapons" id="weapon-cards"></div>
+        </section>
+      </div>
+
+      <footer class="hangar__foot">
+        <p id="hangar-status" class="status"></p>
+        <button id="deploy" class="deploy" type="button">DEPLOY</button>
+      </footer>
     </div>
-    <p id="hint">A / D move &middot; SPACE jump &middot; MOUSE aim &middot; CLICK or J fire</p>
+
     <script type="module" src="js/main.js"></script>
   </body>
 </html>

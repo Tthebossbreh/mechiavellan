@@ -1,9 +1,13 @@
-// Game orchestration: fixed identities (camera, player, bullets) plus the
-// state machine (title -> playing -> gameover) and the render pass.
+// Game orchestration: the state machine (hangar -> playing -> game over), the
+// course assembly, collisions, camera and the render pass.
+//
+// The only thing the game needs to start a run is a loadout produced by the
+// hangar, so a run is fully described by { frame, weapons }.
 
 import { Input } from './input.js';
 import { World } from './world.js';
 import { AudioManager } from './audio.js';
+import { Hangar } from './hangar.js';
 import { Player, Drone, Wrecker, Turret, Bullet, ParticleSystem } from './entities.js';
 import { clamp, rand, aabb } from './utils.js';
 
@@ -42,8 +46,9 @@ export class Game {
     this.bullets = [];
     this.enemies = [];
     this.player = null;
+    this.loadout = null;
 
-    this.state = 'title';
+    this.state = 'hangar';
     this.time = 0;
     this.shake = 0;
     this.score = 0;
@@ -51,6 +56,8 @@ export class Game {
     this.distance = 0;
     this.spawnTimer = 0;
     this.best = loadBest();
+
+    this.hangar = new Hangar(document.getElementById('hangar'), (loadout) => this.deploy(loadout));
 
     window.addEventListener('resize', () => this.resize());
 
@@ -60,7 +67,6 @@ export class Game {
     window.addEventListener('keydown', unlock);
 
     this.resize();
-    this.reset();
 
     this._frame = this._frame.bind(this);
     this.last = null;
@@ -76,20 +82,6 @@ export class Game {
     this.canvas.width = Math.floor(w * dpr);
     this.canvas.height = Math.floor(h * dpr);
     this.world.resize(w, h);
-  }
-
-  reset() {
-    this.player = new Player(180, 0);
-    this.player.y = this.world.groundY(this.player.x + this.player.w / 2) - this.player.h - 30;
-    this.bullets.length = 0;
-    this.enemies.length = 0;
-    this.particles.clear();
-    this.camera.x = this.player.x - this.view.w * 0.35;
-    this.spawnTimer = 1.5;
-    this.score = 0;
-    this.kills = 0;
-    this.distance = 0;
-    this.shake = 0;
   }
 
   start() {
@@ -108,27 +100,52 @@ export class Game {
     requestAnimationFrame(this._frame);
   }
 
+  // --- Run lifecycle --------------------------------------------------------
+
+  /** Called by the hangar when the player hits DEPLOY. */
+  deploy(loadout) {
+    this.loadout = loadout;
+    this.audio.resume();
+    this.reset(loadout);
+    this.state = 'playing';
+  }
+
+  openHangar() {
+    this.state = 'hangar';
+    this.hangar.open();
+  }
+
+  reset(loadout) {
+    this.player = new Player(180, 0, loadout);
+    this.player.y = this.world.groundY(this.player.x + this.player.w / 2) - this.player.h - 30;
+    this.bullets.length = 0;
+    this.enemies.length = 0;
+    this.particles.clear();
+    this.camera.x = this.player.x - this.view.w * 0.35;
+    this.spawnTimer = 1.5;
+    this.score = 0;
+    this.kills = 0;
+    this.distance = 0;
+    this.shake = 0;
+  }
+
   // --- Update ---------------------------------------------------------------
 
   update(dt) {
     this.time += dt;
 
-    if (this.state === 'title') {
-      // Slow drift so the parallax has something to do behind the title.
-      this.camera.x += 70 * dt;
-      if (this.input.anyPressed('Enter', 'NumpadEnter', 'Space') || this.input.mouse.clicked) {
-        this.audio.resume();
-        this.state = 'playing';
-        this.reset();
-      }
+    if (this.state === 'hangar') {
+      // Idle drift so the parallax moves behind the hangar overlay.
+      this.camera.x += 60 * dt;
       return;
     }
 
     if (this.state === 'gameover') {
       this.particles.update(dt);
       if (this.input.anyPressed('Enter', 'NumpadEnter', 'Space')) {
-        this.state = 'playing';
-        this.reset();
+        this.deploy(this.loadout);
+      } else if (this.input.anyPressed('KeyH')) {
+        this.openHangar();
       }
       return;
     }
@@ -149,19 +166,18 @@ export class Game {
       player: this.player,
       particles: this.particles,
       audio: this.audio,
+      enemies: this.enemies,
       spawnBullet: (b) => this.bullets.push(b),
     };
 
     this.player.update(dt, ctx);
     for (const enemy of this.enemies) enemy.update(dt, ctx);
-    for (const bullet of this.bullets) bullet.update(dt);
+    for (const bullet of this.bullets) bullet.update(dt, ctx);
     this.particles.update(dt);
 
-    // Smooth camera follow.
     const targetX = this.player.x - this.view.w * 0.35;
     this.camera.x += (targetX - this.camera.x) * Math.min(1, dt * 5);
 
-    // Difficulty ramps with distance travelled.
     const difficulty = clamp(this.distance / 5000, 0, 1);
     this.spawnTimer -= dt;
     if (this.spawnTimer <= 0 && this.enemies.length < 16) {
@@ -171,7 +187,6 @@ export class Game {
 
     this.handleCollisions();
 
-    // Cull anything that has left the action.
     const far = this.view.w * 1.5;
     this.bullets = this.bullets.filter(
       (b) => !b.dead && Math.abs(b.x - this.camera.x - this.view.w / 2) < far
@@ -228,18 +243,30 @@ export class Game {
   }
 
   handleCollisions() {
-    // Bullets.
     for (const bullet of this.bullets) {
       if (bullet.dead) continue;
 
       if (bullet.friendly) {
         for (const enemy of this.enemies) {
           if (enemy.dead) continue;
-          if (aabb(bullet.box, enemy)) {
+          if (bullet.hits.has(enemy)) continue;
+          if (!aabb(bullet.box, enemy)) continue;
+
+          bullet.hits.add(enemy);
+          this.particles.spawnSparks(bullet.x, bullet.y, 5);
+
+          const killed = enemy.hit(bullet.damage);
+          if (killed) {
+            this.killEnemy(enemy);
+          } else {
+            this.audio.hit();
+          }
+
+          // Piercing rounds keep going until their extra hits run out.
+          if (bullet.pierce > 0) {
+            bullet.pierce -= 1;
+          } else {
             bullet.dead = true;
-            this.particles.spawnSparks(bullet.x, bullet.y, 5);
-            if (enemy.hit(bullet.damage)) this.killEnemy(enemy);
-            else this.audio.hit();
             break;
           }
         }
@@ -253,25 +280,23 @@ export class Game {
       }
     }
 
-    // Player <-> enemy contact.
     if (!this.player.dead) {
       for (const enemy of this.enemies) {
         if (enemy.dead) continue;
-        if (aabb(this.player, enemy)) {
-          if (this.player.takeDamage(enemy.contactDamage)) {
-            this.audio.hurt();
-            this.shake = Math.max(this.shake, 10);
-            this.particles.spawnExplosion(this.player.cx, this.player.cy, 10, '#ff9d6b');
-          }
-          if (enemy.kamikaze) {
-            enemy.dead = true;
-            this.killEnemy(enemy, false);
-          }
+        if (!aabb(this.player, enemy)) continue;
+
+        if (this.player.takeDamage(enemy.contactDamage)) {
+          this.audio.hurt();
+          this.shake = Math.max(this.shake, 10);
+          this.particles.spawnExplosion(this.player.cx, this.player.cy, 10, '#ff9d6b');
+        }
+        if (enemy.kamikaze) {
+          enemy.dead = true;
+          this.killEnemy(enemy, false);
         }
       }
     }
 
-    // Despawn enemies that fall far behind the camera.
     for (const enemy of this.enemies) {
       if (enemy.x + enemy.w < this.camera.x - 260) enemy.dead = true;
     }
@@ -293,18 +318,17 @@ export class Game {
     ctx.translate(shakeX, shakeY);
     this.world.draw(ctx, this.camera, this.view);
 
-    if (this.state !== 'title') {
+    if (this.state !== 'hangar') {
       ctx.save();
       ctx.translate(-Math.round(this.camera.x), 0);
       this.particles.draw(ctx);
       for (const enemy of this.enemies) enemy.draw(ctx);
-      if (!this.player.dead) this.player.draw(ctx);
+      if (this.player && !this.player.dead) this.player.draw(ctx);
       for (const bullet of this.bullets) bullet.draw(ctx);
       ctx.restore();
     }
     ctx.restore();
 
-    // Vignette.
     const vg = ctx.createRadialGradient(
       w / 2, h / 2, Math.min(w, h) * 0.35,
       w / 2, h / 2, Math.max(w, h) * 0.75
@@ -314,13 +338,13 @@ export class Game {
     ctx.fillStyle = vg;
     ctx.fillRect(0, 0, w, h);
 
-    if (this.state === 'title') {
-      this.drawTitle(ctx);
-    } else if (this.state === 'playing') {
+    if (this.state === 'playing') {
       this.drawHUD(ctx);
+      this.drawWeaponRack(ctx);
       this.drawCrosshair(ctx);
-    } else {
+    } else if (this.state === 'gameover') {
       this.drawHUD(ctx);
+      this.drawWeaponRack(ctx);
       this.drawGameOver(ctx);
     }
   }
@@ -331,7 +355,6 @@ export class Game {
     ctx.textBaseline = 'middle';
     ctx.font = '600 13px ui-monospace, SFMono-Regular, Menlo, monospace';
 
-    // Hull bar.
     const barW = 240;
     const barH = 16;
     const x = 22;
@@ -352,20 +375,60 @@ export class Game {
     ctx.strokeRect(x + 0.5, y + 0.5, barW, barH);
 
     ctx.fillStyle = '#9fb3d1';
-    ctx.fillText('HULL', x, y + barH + 15);
+    ctx.fillText(`HULL · ${this.player.frame.name.toUpperCase()}`, x, y + barH + 15);
 
-    // Score.
     ctx.textAlign = 'right';
     ctx.fillStyle = '#dfeaff';
     ctx.font = '700 22px ui-monospace, SFMono-Regular, Menlo, monospace';
     ctx.fillText(String(this.score).padStart(6, '0'), w - 22, 32);
     ctx.font = '600 13px ui-monospace, SFMono-Regular, Menlo, monospace';
     ctx.fillStyle = '#8fa6c9';
-    ctx.fillText(
-      `${Math.floor(this.distance / 10)} m   ·   ${this.kills} kills`,
-      w - 22,
-      56
-    );
+    ctx.fillText(`${Math.floor(this.distance / 10)} m   ·   ${this.kills} kills`, w - 22, 56);
+
+    ctx.restore();
+  }
+
+  /** One tile per installed hardpoint, showing its name and reload state. */
+  drawWeaponRack(ctx) {
+    const weapons = this.player.weaponDefs;
+    if (!weapons.length) return;
+
+    const { w, h } = this.view;
+    const boxW = 104;
+    const boxH = 34;
+    const gap = 8;
+    const total = weapons.length * boxW + (weapons.length - 1) * gap;
+    let x = (w - total) / 2;
+    const y = h - 52;
+
+    ctx.save();
+    ctx.textBaseline = 'middle';
+    ctx.textAlign = 'left';
+
+    for (let i = 0; i < weapons.length; i++) {
+      const weapon = weapons[i];
+      const cooldown = this.player.cooldowns[i];
+      const ready = weapon.cooldown > 0 ? clamp(1 - cooldown / weapon.cooldown, 0, 1) : 1;
+
+      ctx.fillStyle = 'rgba(8, 12, 22, 0.72)';
+      ctx.fillRect(x, y, boxW, boxH);
+      ctx.strokeStyle = ready >= 1 ? 'rgba(127, 230, 255, 0.9)' : 'rgba(90, 110, 140, 0.5)';
+      ctx.lineWidth = 1;
+      ctx.strokeRect(x + 0.5, y + 0.5, boxW - 1, boxH - 1);
+
+      ctx.font = '700 14px ui-monospace, SFMono-Regular, Menlo, monospace';
+      ctx.fillStyle = ready >= 1 ? weapon.color : '#6f83a3';
+      ctx.fillText(weapon.abbr, x + 8, y + 12);
+
+      ctx.font = '600 9px ui-monospace, SFMono-Regular, Menlo, monospace';
+      ctx.fillStyle = '#7f93b8';
+      ctx.fillText(weapon.klass.toUpperCase(), x + 8, y + 24);
+
+      ctx.fillStyle = 'rgba(127, 230, 255, 0.85)';
+      ctx.fillRect(x + 8, y + boxH - 6, (boxW - 16) * ready, 2);
+
+      x += boxW + gap;
+    }
 
     ctx.restore();
   }
@@ -391,47 +454,6 @@ export class Game {
     ctx.restore();
   }
 
-  drawTitle(ctx) {
-    const { w, h } = this.view;
-    ctx.save();
-    ctx.fillStyle = 'rgba(4, 7, 14, 0.55)';
-    ctx.fillRect(0, 0, w, h);
-
-    ctx.textAlign = 'center';
-    ctx.textBaseline = 'middle';
-
-    const cy = h / 2;
-
-    ctx.fillStyle = '#7fe6ff';
-    ctx.shadowColor = '#4fd6ff';
-    ctx.shadowBlur = 26;
-    ctx.font = '800 64px ui-monospace, SFMono-Regular, Menlo, monospace';
-    ctx.fillText('MECHIAVELLAN', w / 2, cy - 70);
-    ctx.shadowBlur = 0;
-
-    ctx.fillStyle = '#9fb3d1';
-    ctx.font = '600 15px ui-monospace, SFMono-Regular, Menlo, monospace';
-    ctx.fillText('PILOT THE MACHINE.  OUT-SCHEME THE SWARM.', w / 2, cy - 18);
-
-    const pulse = 0.6 + 0.4 * Math.sin(this.time * 3);
-    ctx.globalAlpha = pulse;
-    ctx.fillStyle = '#dfeaff';
-    ctx.font = '700 20px ui-monospace, SFMono-Regular, Menlo, monospace';
-    ctx.fillText('[ ENTER ]  OR  CLICK  TO DEPLOY', w / 2, cy + 34);
-    ctx.globalAlpha = 1;
-
-    ctx.fillStyle = '#6f83a3';
-    ctx.font = '600 13px ui-monospace, SFMono-Regular, Menlo, monospace';
-    ctx.fillText('MOVE  A / D      JUMP  SPACE      AIM  MOUSE      FIRE  CLICK / J', w / 2, cy + 82);
-
-    if (this.best > 0) {
-      ctx.fillStyle = '#8fa6c9';
-      ctx.fillText(`BEST  ${String(this.best).padStart(6, '0')}`, w / 2, cy + 116);
-    }
-
-    ctx.restore();
-  }
-
   drawGameOver(ctx) {
     const { w, h } = this.view;
     ctx.save();
@@ -446,26 +468,34 @@ export class Game {
     ctx.shadowColor = '#ff3b3b';
     ctx.shadowBlur = 22;
     ctx.font = '800 52px ui-monospace, SFMono-Regular, Menlo, monospace';
-    ctx.fillText('SYSTEMS CRITICAL', w / 2, cy - 70);
+    ctx.fillText('SYSTEMS CRITICAL', w / 2, cy - 84);
     ctx.shadowBlur = 0;
 
     ctx.fillStyle = '#dfeaff';
     ctx.font = '700 26px ui-monospace, SFMono-Regular, Menlo, monospace';
-    ctx.fillText(String(this.score).padStart(6, '0'), w / 2, cy - 8);
+    ctx.fillText(String(this.score).padStart(6, '0'), w / 2, cy - 26);
 
     ctx.fillStyle = '#8fa6c9';
     ctx.font = '600 14px ui-monospace, SFMono-Regular, Menlo, monospace';
     ctx.fillText(
       `${Math.floor(this.distance / 10)} m   ·   ${this.kills} kills   ·   best ${String(this.best).padStart(6, '0')}`,
       w / 2,
-      cy + 28
+      cy + 8
+    );
+
+    ctx.fillStyle = '#9fb3d1';
+    ctx.font = '600 13px ui-monospace, SFMono-Regular, Menlo, monospace';
+    ctx.fillText(
+      `${this.player.frame.name.toUpperCase()} · ${this.player.weaponDefs.map((x) => x.abbr).join('  ') || 'UNARMED'}`,
+      w / 2,
+      cy + 40
     );
 
     const pulse = 0.6 + 0.4 * Math.sin(this.time * 3);
     ctx.globalAlpha = pulse;
     ctx.fillStyle = '#dfeaff';
     ctx.font = '700 18px ui-monospace, SFMono-Regular, Menlo, monospace';
-    ctx.fillText('[ ENTER ]  TO REDEPLOY', w / 2, cy + 78);
+    ctx.fillText('[ ENTER ]  REDEPLOY     [ H ]  HANGAR', w / 2, cy + 88);
     ctx.globalAlpha = 1;
 
     ctx.restore();

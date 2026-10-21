@@ -1,19 +1,18 @@
 // Every gameplay object: the player mech, enemies, bullets and particles.
 //
-// Visuals are drawn procedurally with canvas primitives, so the game ships
+// Visuals are drawn procedurally with canvas primitives, so the project ships
 // with no image assets. Coordinates are world-space unless noted otherwise.
+//
+// The player is built from a loadout ({ frame, weapons }), so almost every
+// number that matters here — hull, speed, jump, armor, how many guns you have
+// and how they fire — comes from the hangar rather than from this file.
 
 import { clamp, rand } from './utils.js';
 
-// --- Tuning constants -------------------------------------------------------
 const GRAVITY = 2400;
 const MOVE_ACCEL = 5200;
-const MAX_SPEED = 400;
 const GROUND_FRICTION = 4200;
 const AIR_FRICTION = 400;
-const JUMP_VELOCITY = 860;
-const FIRE_COOLDOWN = 0.11;
-const BULLET_SPEED = 980;
 
 // --- Small draw helpers -----------------------------------------------------
 
@@ -40,40 +39,99 @@ function drawHealthBar(ctx, cx, topY, width, ratio) {
 // --- Bullets ----------------------------------------------------------------
 
 export class Bullet {
-  constructor(x, y, vx, vy, friendly, damage = 10, color = '#8fe9ff') {
-    this.x = x;
-    this.y = y;
-    this.vx = vx;
-    this.vy = vy;
-    this.friendly = friendly;
-    this.damage = damage;
-    this.color = color;
-    this.w = 10;
-    this.h = 6;
-    this.life = 1.6;
+  /** @param {object} opts */
+  constructor(opts = {}) {
+    this.x = opts.x ?? 0;
+    this.y = opts.y ?? 0;
+    this.vx = opts.vx ?? 0;
+    this.vy = opts.vy ?? 0;
+    this.friendly = !!opts.friendly;
+    this.damage = opts.damage ?? 10;
+    this.color = opts.color ?? '#8fe9ff';
+    this.w = opts.w ?? 10;
+    this.h = opts.h ?? 6;
+    this.life = opts.life ?? 1.6;
+    this.maxLife = this.life;
+    this.pierce = opts.pierce ?? 0;
+    this.homing = opts.homing ?? 0;
+    this.kind = opts.kind ?? 'ballistic';
+    this.angle = Math.atan2(this.vy, this.vx);
     this.dead = false;
+    // Enemies already damaged by this projectile (so piercing shots do not
+    // tick the same target twice).
+    this.hits = new Set();
   }
 
-  /** Bounding box for collision tests (x/y are the bullet centre). */
+  /** Bounding box for collision tests (x/y are the projectile centre). */
   get box() {
     return { x: this.x - this.w / 2, y: this.y - this.h / 2, w: this.w, h: this.h };
   }
 
-  update(dt) {
+  update(dt, ctx = {}) {
+    if (this.homing > 0 && ctx.enemies && ctx.enemies.length) {
+      this._steer(dt, ctx.enemies);
+    }
     this.x += this.vx * dt;
     this.y += this.vy * dt;
+    this.angle = Math.atan2(this.vy, this.vx);
     this.life -= dt;
     if (this.life <= 0) this.dead = true;
+  }
+
+  _steer(dt, enemies) {
+    let best = null;
+    let bestDist = Infinity;
+    for (const enemy of enemies) {
+      if (enemy.dead) continue;
+      const dx = enemy.x + enemy.w / 2 - this.x;
+      const dy = enemy.y + enemy.h / 2 - this.y;
+      const d2 = dx * dx + dy * dy;
+      if (d2 < bestDist) {
+        bestDist = d2;
+        best = enemy;
+      }
+    }
+    if (!best || bestDist > 720 * 720) return;
+
+    const target = Math.atan2(best.y + best.h / 2 - this.y, best.x + best.w / 2 - this.x);
+    const speed = Math.hypot(this.vx, this.vy) || 1;
+    const diff = ((target - this.angle + Math.PI * 3) % (Math.PI * 2)) - Math.PI;
+    const turn = clamp(diff, -this.homing * dt, this.homing * dt);
+    const angle = this.angle + turn;
+    this.vx = Math.cos(angle) * speed;
+    this.vy = Math.sin(angle) * speed;
+    this.angle = angle;
   }
 
   draw(ctx) {
     ctx.save();
     ctx.translate(this.x, this.y);
-    ctx.rotate(Math.atan2(this.vy, this.vx));
+    ctx.rotate(this.angle);
     ctx.shadowColor = this.color;
     ctx.shadowBlur = 12;
     ctx.fillStyle = this.color;
-    ctx.fillRect(-11, -2, 22, 4);
+
+    if (this.kind === 'missile') {
+      ctx.fillRect(-9, -3, 18, 6);
+      ctx.beginPath();
+      ctx.moveTo(9, -3);
+      ctx.lineTo(15, 0);
+      ctx.lineTo(9, 3);
+      ctx.closePath();
+      ctx.fill();
+      ctx.fillStyle = 'rgba(255, 225, 150, 0.9)';
+      ctx.fillRect(-15, -2, 6, 4);
+    } else if (this.kind === 'energy') {
+      roundRect(ctx, -this.w / 2, -this.h / 2, this.w, this.h, Math.min(this.h, 8) / 2);
+      ctx.fill();
+      ctx.globalAlpha = 0.6;
+      ctx.fillStyle = '#ffffff';
+      roundRect(ctx, -this.w / 4, -this.h / 4, this.w / 2, this.h / 2, Math.min(this.h, 8) / 4);
+      ctx.fill();
+    } else {
+      ctx.fillRect(-this.w / 2, -this.h / 2, this.w, this.h);
+    }
+
     ctx.restore();
   }
 }
@@ -81,19 +139,35 @@ export class Bullet {
 // --- Player -----------------------------------------------------------------
 
 export class Player {
-  constructor(x, y) {
+  /**
+   * @param {number} x
+   * @param {number} y
+   * @param {{frame: object, weapons: object[]}} loadout
+   */
+  constructor(x, y, loadout) {
+    this.frame = loadout.frame;
+    this.weaponDefs = loadout.weapons.slice();
+    this.scale = this.frame.scale;
+
     this.x = x;
     this.y = y;
-    this.w = 44;
-    this.h = 58;
+    this.w = 44 * this.scale;
+    this.h = 58 * this.scale;
+
     this.vx = 0;
     this.vy = 0;
     this.onGround = false;
     this.facing = 1;
     this.armAngle = 0;
-    this.maxHealth = 100;
-    this.health = 100;
-    this.cooldown = 0;
+
+    // Everything below is loadout-driven.
+    this.maxHealth = this.frame.hull;
+    this.health = this.maxHealth;
+    this.armor = this.frame.armor;
+    this.moveSpeed = this.frame.speed;
+    this.jumpVelocity = this.frame.jump;
+
+    this.cooldowns = this.weaponDefs.map(() => 0);
     this.walkPhase = 0;
     this.invuln = 0;
     this.recoil = 0;
@@ -109,8 +183,12 @@ export class Player {
     return this.y + this.h / 2;
   }
 
+  get slotCount() {
+    return this.weaponDefs.length;
+  }
+
   update(dt, ctx) {
-    const { input, world, aim, spawnBullet, particles, audio } = ctx;
+    const { input, world, aim, particles, audio } = ctx;
 
     // --- horizontal movement
     const left = input.anyDown('KeyA', 'ArrowLeft');
@@ -124,11 +202,11 @@ export class Player {
       if (Math.abs(this.vx) <= friction) this.vx = 0;
       else this.vx -= Math.sign(this.vx) * friction;
     }
-    this.vx = clamp(this.vx, -MAX_SPEED, MAX_SPEED);
+    this.vx = clamp(this.vx, -this.moveSpeed, this.moveSpeed);
 
     // --- jump
     if (this.onGround && input.anyPressed('Space', 'KeyW', 'ArrowUp')) {
-      this.vy = -JUMP_VELOCITY;
+      this.vy = -this.jumpVelocity;
       this.onGround = false;
       particles.spawnDust(this.cx, this.y + this.h, 8);
       audio.jump();
@@ -165,21 +243,26 @@ export class Player {
       this.walkPhase += dt * (6 + Math.abs(this.vx) * 0.03);
     }
 
-    // --- firing
-    this.cooldown -= dt;
-    if ((input.mouse.down || input.isDown('KeyJ')) && this.cooldown <= 0) {
-      this.cooldown = FIRE_COOLDOWN;
-      const a = this.armAngle;
-      const mx = this.cx + Math.cos(a) * 26;
-      const my = shoulderY + Math.sin(a) * 26;
-      spawnBullet(
-        new Bullet(mx, my, Math.cos(a) * BULLET_SPEED, Math.sin(a) * BULLET_SPEED, true, 12)
-      );
-      this.recoil = 1;
-      this.muzzleFlash = 0.06;
-      this.vx -= Math.cos(a) * 26; // small kickback
-      particles.spawnMuzzle(mx, my, a);
-      audio.shoot();
+    // --- weapons: every hardpoint runs its own cooldown
+    for (let i = 0; i < this.cooldowns.length; i++) {
+      this.cooldowns[i] = Math.max(0, this.cooldowns[i] - dt);
+    }
+
+    const firing = input.mouse.down || input.isDown('KeyJ');
+    if (firing) {
+      let fired = false;
+      for (let i = 0; i < this.weaponDefs.length; i++) {
+        const weapon = this.weaponDefs[i];
+        if (this.cooldowns[i] > 0) continue;
+        this.cooldowns[i] = weapon.cooldown;
+        this._fireWeapon(i, weapon, ctx);
+        fired = true;
+      }
+      if (fired) {
+        this.recoil = 1;
+        this.muzzleFlash = 0.06;
+        audio.shoot();
+      }
     }
 
     this.recoil = Math.max(0, this.recoil - dt * 6);
@@ -187,9 +270,48 @@ export class Player {
     this.invuln = Math.max(0, this.invuln - dt);
   }
 
+  /** Spawn one shot's worth of projectiles from a specific hardpoint. */
+  _fireWeapon(index, weapon, { spawnBullet, particles }) {
+    const count = this.weaponDefs.length;
+    const angle = this.armAngle;
+    const perp = angle + Math.PI / 2;
+    const offset = (index - (count - 1) / 2) * 11;
+
+    const ox = this.cx + Math.cos(angle) * 24 + Math.cos(perp) * offset;
+    const oy = this.y + this.h * 0.4 + Math.sin(angle) * 24 + Math.sin(perp) * offset;
+
+    const pellets = weapon.pellets || 1;
+    for (let p = 0; p < pellets; p++) {
+      const spread = (Math.random() * 2 - 1) * (weapon.spread || 0);
+      const a = angle + spread;
+      spawnBullet(
+        new Bullet({
+          x: ox,
+          y: oy,
+          vx: Math.cos(a) * weapon.speed,
+          vy: Math.sin(a) * weapon.speed,
+          friendly: true,
+          damage: weapon.damage,
+          color: weapon.color,
+          w: weapon.size.w,
+          h: weapon.size.h,
+          life: weapon.life,
+          pierce: weapon.pierce || 0,
+          homing: weapon.homing || 0,
+          kind: weapon.kind,
+        })
+      );
+    }
+
+    // Heavier weapons shove the mech around more.
+    this.vx -= Math.cos(angle) * (weapon.weight || 3) * 2.2;
+    particles.spawnMuzzle(ox, oy, angle);
+  }
+
   takeDamage(amount) {
     if (this.invuln > 0 || this.dead) return false;
-    this.health -= amount;
+    const dealt = Math.max(1, amount - this.armor);
+    this.health -= dealt;
     this.invuln = 0.85;
     if (this.health <= 0) {
       this.health = 0;
@@ -204,13 +326,12 @@ export class Player {
 
     ctx.save();
     ctx.translate(this.cx, this.y + this.h); // origin at the feet
-    ctx.scale(f, 1);
+    ctx.scale(f * this.scale, this.scale);
     if (blink) ctx.globalAlpha = 0.45;
 
     const walk = this.onGround ? Math.sin(this.walkPhase) * 7 : 0;
     const bob = this.onGround ? Math.abs(Math.cos(this.walkPhase)) * 2 : 0;
 
-    // Legs
     this._leg(ctx, -12 + walk * 0.5);
     this._leg(ctx, 12 - walk * 0.5);
 
@@ -253,24 +374,29 @@ export class Player {
     ctx.fill();
     ctx.shadowBlur = 0;
 
-    // Gun arm, rotated toward the aim direction.
+    // Hardpoints: one barrel per installed weapon, fanned around the arm.
+    const count = this.weaponDefs.length;
     const local = f === 1 ? this.armAngle : Math.PI - this.armAngle;
     const kick = -this.recoil * 5;
+
     ctx.save();
     ctx.translate(4, -34);
     ctx.rotate(local);
-    ctx.fillStyle = '#5b6475';
-    roundRect(ctx, -6 + kick, -6, 34, 12, 4);
-    ctx.fill();
-    ctx.fillStyle = '#3a4150';
-    roundRect(ctx, 20 + kick, -4, 14, 8, 3);
-    ctx.fill();
+    for (let i = 0; i < count; i++) {
+      const off = (i - (count - 1) / 2) * 6.5;
+      ctx.fillStyle = i === 0 ? '#5b6475' : '#4b5364';
+      roundRect(ctx, -6 + kick, off - 3, 32, 6, 2);
+      ctx.fill();
+      ctx.fillStyle = '#3a4150';
+      roundRect(ctx, 22 + kick, off - 2.5, 9, 5, 2);
+      ctx.fill();
+    }
     if (this.muzzleFlash > 0) {
       ctx.fillStyle = 'rgba(255, 240, 170, 0.95)';
       ctx.shadowColor = '#ffd257';
       ctx.shadowBlur = 16;
       ctx.beginPath();
-      ctx.arc(36 + kick, 0, 7, 0, Math.PI * 2);
+      ctx.arc(38 + kick, 0, 7, 0, Math.PI * 2);
       ctx.fill();
       ctx.shadowBlur = 0;
     }
@@ -347,7 +473,6 @@ export class Drone {
     ctx.fill();
     ctx.shadowBlur = 0;
 
-    // Eye
     ctx.fillStyle = '#ffd0d0';
     ctx.beginPath();
     ctx.arc(0, 2, 4, 0, Math.PI * 2);
@@ -357,7 +482,6 @@ export class Drone {
     ctx.arc(0, 2, 1.8, 0, Math.PI * 2);
     ctx.fill();
 
-    // Rotor
     ctx.rotate(this.spin);
     ctx.strokeStyle = 'rgba(200, 220, 255, 0.7)';
     ctx.lineWidth = 3;
@@ -401,7 +525,6 @@ export class Wrecker {
     if (Math.abs(dx) > 44) this.x += dir * this.speed * dt;
     this.walkPhase += dt * 8;
 
-    // Walkers stay glued to the terrain.
     this.y = world.groundY(cx) - this.h;
     this.hitFlash = Math.max(0, this.hitFlash - dt * 4);
   }
@@ -423,14 +546,12 @@ export class Wrecker {
 
     const walk = Math.sin(this.walkPhase) * 6;
 
-    // Legs
     ctx.fillStyle = '#2b3140';
     roundRect(ctx, -20 + walk * 0.4, -24, 16, 26, 4);
     ctx.fill();
     roundRect(ctx, 4 - walk * 0.4, -24, 16, 26, 4);
     ctx.fill();
 
-    // Torso
     const body = ctx.createLinearGradient(0, -60, 0, -18);
     body.addColorStop(0, flash ? '#ffffff' : '#9c4b4b');
     body.addColorStop(1, '#4d2027');
@@ -441,7 +562,6 @@ export class Wrecker {
     ctx.lineWidth = 2;
     ctx.stroke();
 
-    // Visor
     ctx.fillStyle = flash ? '#ffffff' : '#ffb15c';
     ctx.shadowColor = '#ff7a3c';
     ctx.shadowBlur = 12;
@@ -489,7 +609,18 @@ export class Turret {
       const mx = cx + Math.cos(this.aimAngle) * 26;
       const my = muzzleY + Math.sin(this.aimAngle) * 26;
       spawnBullet(
-        new Bullet(mx, my, Math.cos(this.aimAngle) * speed, Math.sin(this.aimAngle) * speed, false, 10, '#ff7a6b')
+        new Bullet({
+          x: mx,
+          y: my,
+          vx: Math.cos(this.aimAngle) * speed,
+          vy: Math.sin(this.aimAngle) * speed,
+          friendly: false,
+          damage: 10,
+          color: '#ff7a6b',
+          w: 10,
+          h: 6,
+          life: 2.0,
+        })
       );
       particles.spawnMuzzle(mx, my, this.aimAngle);
       audio.tone({ freq: 300, type: 'sawtooth', duration: 0.08, gain: 0.025, sweep: -140 });
@@ -513,7 +644,6 @@ export class Turret {
     ctx.save();
     ctx.translate(cx, base);
 
-    // Base
     ctx.fillStyle = '#333b4c';
     roundRect(ctx, -23, -22, 46, 22, 5);
     ctx.fill();
@@ -521,7 +651,6 @@ export class Turret {
     roundRect(ctx, -15, -16, 30, 16, 3);
     ctx.fill();
 
-    // Rotating head + barrel
     ctx.save();
     ctx.translate(0, -22);
     ctx.rotate(this.aimAngle);
